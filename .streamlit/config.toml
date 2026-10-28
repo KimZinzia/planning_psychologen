@@ -1,0 +1,44 @@
+# Huisstijl Zinzia (zie www.zinzia.nl): goud/brons als hoofdkleur met crème,
+# zoals de standaardweergave van de website. Lettertype: Figtree, een vrij
+# beschikbaar alternatief voor Proxima Nova (het Adobe-lettertype van de site).
+
+[theme]
+base = "light"
+primaryColor = "#B38C4F"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F4ED"
+textColor = "#1C1B1A"
+linkColor = "#8A6A36"
+borderColor = "#E7E1D6"
+showWidgetBorder = true
+baseRadius = "0.6rem"
+buttonRadius = "full"
+
+font = "Figtree:https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap, sans-serif"
+headingFont = "Figtree:https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap, sans-serif"
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+headingFontSizes = ["2.1rem", "1.45rem", "1.15rem", "1rem", "0.95rem", "0.9rem"]
+metricValueFontWeight = 600
+
+dataframeHeaderBackgroundColor = "#F7F4ED"
+dataframeHeaderTextColor = "#1C1B1A"
+dataframeBorderColor = "#EDE8DE"
+
+# Meldingskleuren rustiger en passend bij het logo.
+greenColor = "#2F8F8B"
+greenBackgroundColor = "#E6F4F3"
+blueColor = "#4A6B8A"
+blueBackgroundColor = "#EEF2F6"
+yellowColor = "#9A6B12"
+yellowBackgroundColor = "#FBF3E2"
+redColor = "#B42346"
+redBackgroundColor = "#FBE9EE"
+
+[theme.sidebar]
+backgroundColor = "#F7F4ED"
+secondaryBackgroundColor = "#FFFFFF"
+borderColor = "#E7E1D6"
+
+[client]
+# Geen ontwikkelaarsmenu (Deploy e.d.) in de app.
+toolbarMode = "minimal"
