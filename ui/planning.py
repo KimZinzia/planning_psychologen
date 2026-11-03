@@ -14,11 +14,11 @@ import streamlit as st
 
 import achtergrond
 import store
-from controles import signalen
+from controles import RUIMTE_KRAP, signalen
 from data import DAG_NAMEN, WERKDAGEN, Params, params_from_tables, valideer
 from model import CONSTRAINT_GROEPEN
 from output import excel_bytes
-from solve import STAPPEN, huidig_rooster, vergelijk_roosters
+from solve import STAPPEN, bezetting_bereik, bezetting_per_medewerker, huidig_rooster, vergelijk_roosters
 from ui.helpers import STATUS_LABELS, kleur_status, legenda, nl_datum, nl_getal, toon_signalen
 from ui.stijl import paginakop
 
@@ -116,7 +116,7 @@ def _toon_afloop() -> None:
         else:
             tekst += (
                 "Het knelpunt zit in een combinatie van meerdere groepen regels. Controleer vooral of de inzetbare tijd "
-                "de vereiste uren dekt, en of de minimumuren, MDO-dagen en vastzettingen niet te krap zijn."
+                "de vereiste uren dekt, en of de afspraken (Extra eisen) en MDO-dagen niet te krap zijn."
             )
         st.error(tekst, icon=":material/error:")
     elif taak.geslaagd:
@@ -234,8 +234,35 @@ def _dialoog_uren(p: Params, rooster: pd.DataFrame) -> None:
         st.dataframe(per_e.style.format(nl_getal, subset=["Inzetbaar", "Gepland", "Niet ingepland"]), hide_index=True, width="stretch")
 
 
+@st.dialog("Verdeling van de uren", width="large")
+def _dialoog_verdeling(p: Params, rooster: pd.DataFrame, oud: pd.DataFrame, label_oud: str) -> None:
+    nieuw, vorig = bezetting_per_medewerker(p, rooster), bezetting_per_medewerker(p, oud)
+    laag, hoog = bezetting_bereik(p, rooster)
+    st.markdown(
+        "Bezetting = ingeplande uren gedeeld door inzetbare uren. Derde doel: medewerkers zonder gz liefst tussen "
+        f"{round(p.min_bezetting_niet_gz * 100)}% en {round(p.max_bezetting_niet_gz * 100)}%, gz-psychologen zo dicht mogelijk bij "
+        f"{round(p.streef_bezetting_gz * 100)}%, en binnen elke groep iedereen ongeveer even vol, "
+        f"zonder dat de eerste twee doelen slechter worden. In deze planning zit iedereen tussen **{laag}%** en "
+        f"**{hoog}%**. Medewerkers met 0 inzetbare uren staan er niet bij."
+    )
+    tabel = nieuw.merge(vorig[["medewerker", "bezetting"]].rename(columns={"bezetting": "vorig"}), on="medewerker", how="left")
+    tabel = tabel.sort_values("bezetting").rename(columns={
+        "medewerker": "Medewerker", "inzetbaar": "Inzetbaar", "gepland": "Gepland",
+        "bezetting": "Bezetting", "vorig": f"Bezetting {label_oud.lower()}",
+    })
+    st.dataframe(
+        tabel, hide_index=True, width="stretch",
+        column_config={
+            "Inzetbaar": st.column_config.NumberColumn(format="localized"),
+            "Gepland": st.column_config.NumberColumn(format="localized"),
+            "Bezetting": st.column_config.ProgressColumn(format="%.0f%%", min_value=0, max_value=100),
+            f"Bezetting {label_oud.lower()}": st.column_config.NumberColumn(format="%.0f%%"),
+        },
+    )
+
+
 def toon_kerncijfers(p: Params, rooster: pd.DataFrame, oud: pd.DataFrame, sleutel: str, label_oud: str = "Nu") -> None:
-    """De drie doelen van het model + totaal ingeplande uren, vergeleken met `oud`.
+    """De doelen van het model + totaal ingeplande uren, vergeleken met `oud`.
     Onder elk cijfer opent de knop Details een venster met wat erachter zit."""
     cmp = vergelijk_roosters(oud, rooster)
     cmp["Status"] = cmp["status"].map(STATUS_LABELS)
@@ -245,37 +272,51 @@ def toon_kerncijfers(p: Params, rooster: pd.DataFrame, oud: pd.DataFrame, sleute
     ingepland, vereist = rooster["uren"].sum(), sum(p.req.values())
     vgl = label_oud.lower()
 
-    kolommen = st.columns(4)
+    b_laag, b_hoog = bezetting_bereik(p, rooster)
+    o_laag, o_hoog = bezetting_bereik(p, oud)
+
+    kolommen = st.columns(5)
     with kolommen[0].container(border=True, key=f"kaart_{sleutel}_1"):
         st.metric(
-            "Gewijzigde toewijzingen", wijzigingen,
+            "Wijzigingen", wijzigingen,
             delta=f"van de {len(cmp)} toewijzingen", delta_color="off", delta_arrow="off",
             help=f"Hoeveel toewijzingen anders zijn dan {vgl}. Een toewijzing is één medewerker op één afdeling op één "
-            "locatie; nieuw, gestopt of een ander aantal uren telt elk als 1. Dit is het eerste en belangrijkste doel: "
-            "zo weinig mogelijk wijzigingen.",
+            "locatie; nieuw, gestopt of een ander aantal uren telt elk als 1. Eerste doel: zo weinig mogelijk "
+            "wijzigingen én reizigers samen; die twee zijn even belangrijk.",
         )
         if st.button("Details", icon=":material/open_in_full:", type="tertiary", key=f"{sleutel}_d1"):
             _dialoog_wijzigingen(cmp, label_oud, "Deze planning")
     with kolommen[1].container(border=True, key=f"kaart_{sleutel}_2"):
         st.metric(
-            f"Werkt op {p.l1} én {p.l2}", reis_nieuw, delta=reis_nieuw - reis_oud, delta_color="inverse",
-            help=f"Aantal medewerkers dat zowel op {p.l1} als op {p.l2} werkt en dus moet reizen. Tweede doel: zo weinig "
-            f"mogelijk. Het getal met het pijltje is het verschil met {vgl} (groen = minder reizen).",
+            f"Reizen {p.l1}–{p.l2}", reis_nieuw, delta=reis_nieuw - reis_oud, delta_color="inverse",
+            help=f"Aantal medewerkers dat zowel op {p.l1} als op {p.l2} werkt en dus moet reizen. Eerste doel, samen met "
+            f"de wijzigingen: zo weinig mogelijk. Het getal met het pijltje is het verschil met {vgl} (groen = minder reizen).",
         )
         if st.button("Details", icon=":material/open_in_full:", type="tertiary", key=f"{sleutel}_d2"):
             _dialoog_reizen(p, rooster, oud, label_oud)
     with kolommen[2].container(border=True, key=f"kaart_{sleutel}_3"):
         st.metric(
-            "Medewerker-afdeling-koppels", k_nieuw, delta=k_nieuw - k_oud, delta_color="inverse",
+            "Koppels", k_nieuw, delta=k_nieuw - k_oud, delta_color="inverse",
             help=f"Per afdeling het aantal verschillende medewerkers, opgeteld ({UITGEZONDERD_HEADCOUNT} telt niet mee). "
-            "Werkt iemand op 3 afdelingen, dan telt die 3 keer. Derde doel: liever weinig verschillende mensen per "
+            "Werkt iemand op 3 afdelingen, dan telt die 3 keer. Vierde doel: liever weinig verschillende mensen per "
             f"afdeling. Het pijltje is het verschil met {vgl} (groen = minder).",
         )
         if st.button("Details", icon=":material/open_in_full:", type="tertiary", key=f"{sleutel}_d3"):
             _dialoog_koppels(rooster, oud, label_oud)
-    with kolommen[3].container(border=True, key=f"kaart_{sleutel}_4"):
+    with kolommen[3].container(border=True, key=f"kaart_{sleutel}_5"):
         st.metric(
-            "Ingeplande uren per week", _uren(ingepland), delta=f"{_uren(ingepland - vereist)} t.o.v. vereist", delta_color="off",
+            "Bezetting", f"{b_laag}–{b_hoog}%",
+            delta=f"{label_oud}: {o_laag}–{o_hoog}%", delta_color="off", delta_arrow="off",
+            help="Ingeplande uren gedeeld door inzetbare uren: van de minst tot de meest bezette medewerker. "
+            f"Derde doel: niet-gz liefst tussen {round(p.min_bezetting_niet_gz * 100)}% en {round(p.max_bezetting_niet_gz * 100)}%, gz zo dicht mogelijk bij "
+            f"{round(p.streef_bezetting_gz * 100)}%, en binnen elke groep zo gelijk mogelijk. "
+            "De uren worden daarbij in hele of halve uren ingepland.",
+        )
+        if st.button("Details", icon=":material/open_in_full:", type="tertiary", key=f"{sleutel}_d5"):
+            _dialoog_verdeling(p, rooster, oud, label_oud)
+    with kolommen[4].container(border=True, key=f"kaart_{sleutel}_4"):
+        st.metric(
+            "Uren per week", _uren(ingepland), delta=f"{_uren(ingepland - vereist)} t.o.v. vereist", delta_color="off",
             help=f"Totaal aantal ingeplande uren per week. De afdelingen hebben samen {_uren(vereist)} uur nodig; "
             "het getal eronder is het verschil daarmee.",
         )
@@ -344,11 +385,18 @@ def toon_rooster(
                 "Rooster": "  ·  ".join(f"{a} ({l}) {_uren(u)}" for a, l, u in zip(r["afdeling"], r["locatie"], r["uren"])),
             })
         per_med = pd.DataFrame(rijen)
+        # De kolom Rooster krijgt de breedte van de langste tekst (± 7,5 px per teken), zodat
+        # niets wordt afgekapt; de tabel krijgt dan een horizontale schuifbalk.
+        langste = int(per_med["Rooster"].str.len().max() or 0) if len(per_med) else 0
         st.dataframe(
             per_med.style.format(nl_getal, subset=["Inzetbaar", "Ingepland"]),
             hide_index=True, width="stretch", height="content",
-            column_config={"Rooster": st.column_config.TextColumn(width="large")},
+            column_config={
+                "Medewerker": st.column_config.TextColumn(pinned=True),
+                "Rooster": st.column_config.TextColumn(width=max(400, min(int(langste * 7.5) + 24, 2400))),
+            },
         )
+        st.caption("Schuif de tabel naar rechts (shift + scrollen, of de schuifbalk onderaan) om het hele rooster te zien.")
 
     # --- wijzigingen
     with tab_wijz:
@@ -393,6 +441,30 @@ def toon_rooster(
 # ------------------------------------------------------------------ pagina
 
 
+def _capaciteit(p: Params) -> None:
+    """Vast blok bovenaan: hoeveel uur nodig is en hoeveel er inzetbaar is."""
+    vereist, inzetbaar = sum(p.req.values()), sum(p.avail.values())
+    ruimte = inzetbaar - vereist
+    gemiddeld = 100 * vereist / inzetbaar if inzetbaar else 0
+    if ruimte < 0:
+        oordeel, kleur = f"tekort van {_uren(-ruimte)} uur: de planning verdeelt het tekort", "red"
+    elif ruimte < RUIMTE_KRAP * vereist:
+        oordeel, kleur = "krap: weinig speling, het rekenen kan langer duren", "orange"
+    else:
+        oordeel, kleur = "voldoende", "green"
+    with st.container(border=True, key="kaart_capaciteit"):
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1.4], vertical_alignment="center")
+        c1.metric("Nodig per week", f"{_uren(vereist)} uur", help="Opgeteld: de vereiste uren van alle afdelingen (Invoer → Afdelingen).")
+        c2.metric("Inzetbaar per week", f"{_uren(inzetbaar)} uur",
+                  help="Opgeteld: de inzetbare uren van alle medewerkers, na aftrek van verlof, opleiding en taken en met de "
+                  "PIOG-correctie (Invoer → Team).")
+        c3.metric("Ruimte", f"{_uren(ruimte)} uur", help="Inzetbaar min nodig: de speling die de planning heeft.")
+        with c4:
+            st.markdown(f"**Capaciteit :{kleur}[{oordeel}]**")
+            st.progress(min(max(gemiddeld / 100, 0.0), 1.0))
+            st.caption(f"Gemiddeld {gemiddeld:.0f}% van de inzetbare uren is nodig.")
+
+
 def pagina_planning() -> None:
     paginakop("Planning", "Bereken het rooster, bekijk wat er verandert ten opzichte van nu en bewaar het resultaat.")
     if not store.heeft_gegevens():
@@ -404,16 +476,29 @@ def pagina_planning() -> None:
     lijst = signalen(tabellen)
     blokkerend = any(s.niveau == "fout" for s in lijst)
     bezig = achtergrond.bezig()
-    toon_signalen(lijst, alleen_belangrijk=True)
+    # De capaciteitsmelding staat al in het blok Capaciteit; niet dubbel tonen.
+    toon_signalen([s for s in lijst if not s.tekst.startswith("Nog maar")], alleen_belangrijk=True)
+    if p.tijdelijk:
+        st.warning(
+            f"**Noodplanning actief:** {len(p.tijdelijk)} tijdelijke aanpassing(en).\n\n"
+            + "\n".join(f"- {z}" for z in p.tijdelijk),
+            icon=":material/emergency:",
+        )
+    _capaciteit(p)
 
     c1, c2 = st.columns([1, 3], vertical_alignment="center")
     if c1.button("Plan maken", icon=":material/play_arrow:", type="primary", disabled=blokkerend or bezig, width="stretch"):
         if start_planning():
             st.rerun()
     c2.caption(
-        "Berekent het beste rooster op basis van de opgeslagen invoer: eerst zo min mogelijk wijzigingen, "
-        f"dan zo min mogelijk reizen tussen {p.l1} en {p.l2}, dan zo min mogelijk mensen per afdeling. "
-        "Dit kan enkele minuten duren."
+        f"Berekent het beste rooster op basis van de opgeslagen invoer: basispsychologen liefst niet boven "
+        f"{round(p.max_bezetting_basis * 100)}%, dan zo min mogelijk wijzigingen en "
+        f"reizen tussen {p.l1} en {p.l2} (even belangrijk), dan liefst een gz-psycholoog bij alle MDO's, "
+        f"dan de uren eerlijk verdelen (gz rond {round(p.streef_bezetting_gz * 100)}%, anderen liefst tussen "
+        f"{round(p.min_bezetting_niet_gz * 100)}% en {round(p.max_bezetting_niet_gz * 100)}%), "
+        "en tot slot zo min mogelijk mensen per afdeling. "
+        + "".join(f"{a} en {b} worden nooit gecombineerd. " for a, b in p.nooit_samen)
+        + "Dit duurt meestal 5 à 10 minuten; je kunt intussen gewoon verder werken."
     )
     _voortgang_hoofd()
     _toon_afloop()
@@ -430,12 +515,34 @@ def pagina_planning() -> None:
     st.subheader("Resultaat")
     st.caption(f"Berekend op {nl_datum(meta['tijdstip'])}")
     if kpi.get("invoer") != invoer_hash(tabellen):
-        st.warning("De invoer of bijsturing is gewijzigd sinds deze planning is berekend. Klik op **Plan maken** voor een actuele planning.")
+        st.warning("De invoer is gewijzigd sinds deze planning is berekend. Klik op **Plan maken** voor een actuele planning.")
     if kpi.get("niet_bewezen_optimaal"):
         st.info(
             "De rekentijd was op voordat bewezen kon worden dat dit de allerbeste planning is "
             f"(stap: {', '.join(kpi['niet_bewezen_optimaal'])}). Het rooster voldoet wel aan alle regels; "
             "mogelijk bestaat er een planning met nog iets minder wijzigingen of reizen."
+        )
+    if kpi.get("tekort"):
+        totaal = sum(kpi["tekort"].values())
+        st.error(
+            f"Er is te weinig formatie: {_uren(totaal)} uur per week kan niet worden ingepland. Zo is het tekort "
+            "verdeeld (afdelingen met voorrang zo min mogelijk):\n\n"
+            + "\n".join(f"- {afd}: {_uren(u)} uur tekort" for afd, u in sorted(kpi["tekort"].items())),
+            icon=":material/warning:",
+        )
+    if kpi.get("boven_max_basis"):
+        st.warning(
+            f"Het lukte niet om alle basispsychologen onder {round(p.max_bezetting_basis * 100)}% van hun inzetbare uren "
+            "te houden: " + ", ".join(f"{e} ({_uren(u)} uur erboven)" for e, u in kpi["boven_max_basis"].items())
+            + ". Zonder die extra uren is er geen planning mogelijk.",
+            icon=":material/trending_up:",
+        )
+    if kpi.get("mdo_zonder_gz"):
+        st.info(
+            "Bij deze afdeling(en) met meerdere MDO-dagen is geen gz-psycholoog bij álle MDO's: "
+            f"{', '.join(kpi['mdo_zonder_gz'])}. Elk MDO heeft wel een psycholoog. Een gz-psycholoog erbij zou "
+            "extra wijzigingen of reizen kosten; wil je het toch, zet dan iemand vast via Invoer → Extra eisen.",
+            icon=":material/groups:",
         )
 
     oud = huidig_rooster(p)

@@ -2,17 +2,28 @@
 
 Webapp die de weekplanning van psychologen over afdelingen en locaties maakt.
 Een optimalisatiemodel verdeelt de vereiste uren over de medewerkers en houdt
-daarbij rekening met:
+daarbij rekening met (op volgorde):
 
-1. **zo min mogelijk wijzigingen** ten opzichte van de huidige planning;
-2. daarbinnen **zo weinig mogelijk reizen** tussen twee ingestelde locaties;
-3. daarbinnen **zo weinig mogelijk medewerkers per afdeling**.
+0. **basispsychologen** (geen gz, niet in opleiding) liefst niet voller dan een
+   in te stellen percentage (standaard 85%) van hun inzetbare uren;
+1. **zo min mogelijk wijzigingen** ten opzichte van de huidige planning én
+   **zo weinig mogelijk reizen** tussen twee ingestelde locaties ("liever niet
+   combineren", bv. ONO en LH); die twee tellen even zwaar;
+2. daarbinnen bij afdelingen met meerdere MDO-dagen **liefst een
+   gz-psycholoog bij alle MDO's**;
+3. daarbinnen de uren **eerlijk verdelen**: medewerkers zonder gz liefst tussen
+   75% en 85%, gz-psychologen zo dicht mogelijk bij 90% van hun inzetbare uren
+   (beide in te stellen), en binnen elke groep iedereen ongeveer even vol, in
+   hele of halve uren;
+4. daarbinnen **zo weinig mogelijk medewerkers per afdeling**.
 
 Harde regels: vereiste uren per afdeling/locatie worden gedekt, niemand werkt
 meer dan de inzetbare tijd, minimaal één gz-psycholoog per locatie, sommige
 afdelingen alleen voor gz-psychologen, en optioneel: maximum aantal
 medewerkers per afdeling, afdelingsgroepen op één locatie, verplichte
-minimumuren, en handmatige bijsturing (vastzetten/uitsluiten).
+MDO-dagen, locaties die nooit gecombineerd mogen worden (bv. ONO en RK) en
+afspraken per medewerker (minimaal/precies X uur, of uitsluiten; voor een
+afdeling, een afdelingsgroep of een hele locatie).
 
 Alle gebruikte software is open source (geen licentiekosten):
 [PuLP](https://github.com/coin-or/pulp) als modelleertaal,
@@ -23,10 +34,11 @@ de webinterface.
 
 | Pagina | Wat je er doet |
 |---|---|
-| **Invoer** | Team (contracturen, aftrekposten, werkdagen), afdelingen (met MDO-dag), huidige planning en extra eisen (minimumuren) bijhouden. Medewerkers voer je op één plek in; elders kies je ze uit een lijst. Hernoemen of verwijderen werkt automatisch door in de andere tabellen. |
-| **Planning** | Op *Plan maken* klikken (duurt enkele minuten), het rooster bekijken, de wijzigingen ten opzichte van de huidige planning zien en het resultaat als Excel downloaden. Een goedgekeurd rooster kan worden overgenomen als nieuwe huidige planning. |
-| **Bijsturen** | Een medewerker vastzetten op of uitsluiten van een afdeling en opnieuw plannen. |
+| **Invoer** | Team (contracturen, aftrekposten, werkdagen), afdelingen (met MDO-dag), huidige planning en extra eisen (afspraken per medewerker en reisregels) bijhouden. Medewerkers voer je op één plek in; elders kies je ze uit een lijst. Hernoemen of verwijderen werkt automatisch door in de andere tabellen. |
+| **Planning** | Op *Plan maken* klikken (duurt 5 à 10 minuten), het rooster bekijken, de wijzigingen ten opzichte van de huidige planning zien en het resultaat als Excel downloaden. Een goedgekeurd rooster kan worden overgenomen als nieuwe huidige planning. |
+| **Noodplanning** | Tijdelijke aanpassingen met einddatum bij krappe formatie: andere uren per afdeling, meer/minder uren per medewerker, regels tijdelijk loslaten. Bij te weinig formatie maakt de planning ook zonder aanpassingen een rooster en verdeelt het tekort eerlijk (afdelingen met voorrang zo min mogelijk). |
 | **Archief** | Bewaarde planningen (bijv. per periode) terugkijken en met elkaar of met de huidige planning vergelijken. |
+| **Toelichting** | De doelen en regels van het model in gewone taal, met voorbeelden (en de formules voor wie dat wil). |
 
 Bovenaan Invoer en Planning staan automatische **aandachtspunten**, zoals te
 weinig ruimte, of een afdeling waar op de MDO-dag niemand kan zijn. Onderaan
@@ -51,10 +63,12 @@ De app opent op http://localhost:8501.
 ## Projectstructuur
 
 ```
-app.py               webinterface: menu en pagina Bijsturen
+app.py               webinterface: menu en zijbalk
 ui/planning.py       webinterface: pagina Planning (en roosterweergave)
 ui/invoer.py         webinterface: pagina Invoer
+ui/nood.py           webinterface: pagina Noodplanning
 ui/archief.py        webinterface: pagina Archief
+ui/toelichting.py    webinterface: pagina Toelichting (model in gewone taal)
 ui/helpers.py        gedeelde hulpfuncties voor de webinterface
 ui/stijl.py          huisstijl Zinzia: logo, paginakop, legenda
 .streamlit/config.toml  thema (kleuren, lettertype)
@@ -96,7 +110,7 @@ regelmatig een back-up van.
   gedeelde database (bijv. PostgreSQL) de logische volgende stap. Alleen
   `src/store.py` hoeft dan te veranderen.
 - **Rekentijd en geheugen:** een planning kost bij ~15 medewerkers en ~35
-  afdeling/locatie-combinaties enkele minuten (maximaal ~6) rekentijd op één CPU-kern en
+  afdeling/locatie-combinaties 5 à 10 minuten (maximaal ~16) rekentijd op één CPU-kern en
   weinig geheugen (< 500 MB).
 - **Instellingen:** het pad van de database is in te stellen met de
   omgevingsvariabele `PLANNING_DB` (standaard `data/planning.db`).

@@ -78,7 +78,7 @@ def wijzig_medewerkers(t: Tabellen, nieuw: pd.DataFrame) -> tuple[Tabellen, list
     t = dict(t)
     t["Employees"] = nieuw
     meldingen = [f"'{o}' heet nu '{n}' (ook aangepast in de andere tabellen)." for o, n in hernoemd.items()]
-    for tabel in ["CurrentSchedule", "MinimumUren", "Bijsturing"]:
+    for tabel in ["CurrentSchedule", "Afspraken", "TijdelijkMedewerker"]:
         df = t[tabel].copy()
         df["medewerker"] = df["medewerker"].map(lambda e: hernoemd.get(e, e))
         voor = len(df)
@@ -110,8 +110,9 @@ def wijzig_locaties(t: Tabellen, nieuw: pd.DataFrame) -> tuple[Tabellen, list[st
 
     t = dict(t)
     t["Locaties"] = nieuw
-    for tabel, kolom in [("Requirements", "locatie"), ("CurrentSchedule", "locatie"), ("MinimumUren", "locatie"),
-                         ("Bijsturing", "locatie"), ("Config", "value")]:
+    for tabel, kolom in [("Requirements", "locatie"), ("CurrentSchedule", "locatie"), ("Afspraken", "locatie"),
+                         ("TijdelijkAfdeling", "locatie"),
+                         ("Config", "value")]:
         df = t[tabel].copy()
         df[kolom] = df[kolom].map(lambda l: hernoemd.get(l, l))
         t[tabel] = df
@@ -168,8 +169,8 @@ def wijzig_vereisten(t: Tabellen, nieuw: pd.DataFrame) -> tuple[Tabellen, list[s
             meldingen.append(f"{_meervoud(voor - len(cs), 'regel', 'regels')} van verwijderde afdelingen weggehaald uit de huidige planning.")
     t["CurrentSchedule"] = cs
 
-    # Minimumuren en bijsturing: afdelingsnaam meenemen; regels die niet meer kloppen weghalen.
-    for tabel in ["MinimumUren", "Bijsturing"]:
+    # Afspraken: afdelingsnaam meenemen; regels die niet meer kloppen weghalen.
+    for tabel in ["Afspraken", "TijdelijkAfdeling"]:
         df = t[tabel].copy()
         df["afdeling"] = df["afdeling"].map(lambda d: afd_hernoemd.get(d, d))
         geldig = [
@@ -187,6 +188,7 @@ def wijzig_vereisten(t: Tabellen, nieuw: pd.DataFrame) -> tuple[Tabellen, list[s
 def tabel_label(tabel: str) -> str:
     return {
         "CurrentSchedule": "de huidige planning",
-        "MinimumUren": "de extra eisen",
-        "Bijsturing": "de bijsturing",
+        "Afspraken": "de afspraken",
+        "TijdelijkAfdeling": "de noodplanning",
+        "TijdelijkMedewerker": "de noodplanning",
     }.get(tabel, tabel)

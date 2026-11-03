@@ -37,6 +37,9 @@ def pagina_archief() -> None:
         "Gewijzigde toewijzingen": lijst["kpi"].map(lambda k: k.get("deviation")),
         "Op beide reislocaties": lijst["kpi"].map(lambda k: k.get("travel")),
         "Koppels (excl. AGT)": lijst["kpi"].map(lambda k: k.get("headcount")),
+        "Bezetting": lijst["kpi"].map(
+            lambda k: f"{k['bezetting_laag']}–{k['bezetting_hoog']}%" if "bezetting_laag" in k else "–"
+        ),
     })
     with st.container(border=True):
         st.subheader("Bewaarde planningen")

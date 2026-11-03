@@ -42,9 +42,10 @@ def signalen(tabellen: dict[str, pd.DataFrame]) -> list[Signaal]:
     result += _capaciteit(p)
     result += _gz(p)
     result += _mdo(p)
-    result += _minimum_uren(p)
+    result += _afspraken(p)
     result += _huidige_planning(p)
     result += _werkdagen(p)
+    result += _nooit_samen(p)
     volgorde = {"fout": 0, "waarschuwing": 1, "info": 2}
     return sorted(result, key=lambda s: volgorde[s.niveau])
 
@@ -54,9 +55,10 @@ def _capaciteit(p: Params) -> list[Signaal]:
     ruimte = inzetbaar - vereist
     if ruimte < 0:
         return [Signaal(
-            "fout",
+            "waarschuwing",
             f"Er is {_uren(-ruimte)} uur per week te weinig: {_uren(inzetbaar)} uur inzetbaar, {_uren(vereist)} uur vereist. "
-            "Er is geen planning mogelijk.",
+            "De planning verdeelt het tekort zo eerlijk mogelijk (afdelingen met voorrang zo min mogelijk). "
+            "Zie ook de pagina Noodplanning.",
         )]
     if ruimte < RUIMTE_KRAP * vereist:
         return [Signaal(
@@ -80,23 +82,23 @@ def _gz(p: Params) -> list[Signaal]:
 
 
 def _mdo(p: Params) -> list[Signaal]:
-    """Per afdeling met een MDO-dag: zijn er genoeg medewerkers die op die dag werken?"""
+    """Per afdeling met MDO-dag(en): zijn er genoeg medewerkers die op die dag(en) werken?"""
     details_fout, details_krap = [], []
-    for (d, l), dag in sorted(p.mdo_dag.items()):
-        if (d, l) not in p.req:
+    for (d, l), mdo in sorted(p.mdo_dag.items()):
+        if (d, l) not in p.req or p.req[d, l] <= 0:
             continue
-        kandidaten = [
-            e for e in p.E
-            if p.avail[e] > 0
-            and (not p.werkdagen.get(e) or dag in p.werkdagen[e])
-            and (p.gz_only.get((d, l), 0) == 0 or p.gz.get(e, 0) == 1)
-        ]
+        mag = [e for e in p.E if p.avail[e] > 0 and (p.gz_only.get((d, l), 0) == 0 or p.gz.get(e, 0) == 1)]
+        werkt_op = lambda e, dag: not p.werkdagen.get(e) or dag in p.werkdagen[e]  # noqa: E731
+        kandidaten = [e for e in mag if any(werkt_op(e, dag) for dag in mdo)]
         uren = sum(p.avail[e] for e in kandidaten)
-        naam = f"{d} ({l}), MDO op {DAG_NAMEN[dag]}"
-        if not kandidaten:
+        naam = f"{d} ({l}), MDO op {' en '.join(DAG_NAMEN.get(dag, dag) for dag in mdo)}"
+        leeg = [dag for dag in mdo if not any(werkt_op(e, dag) for e in mag)]
+        if leeg:
+            details_fout.append(f"{naam}: niemand die hier mag werken, werkt op {' en '.join(DAG_NAMEN.get(x, x) for x in leeg)}.")
+        elif not kandidaten:
             details_fout.append(f"{naam}: niemand die hier mag werken, werkt op die dag.")
         elif uren < p.req[d, l]:
-            details_fout.append(
+            details_krap.append(
                 f"{naam}: wie op die dag werkt, heeft samen {_uren(uren)} uur; nodig is {_uren(p.req[d, l])}."
             )
         elif len(kandidaten) <= 2:
@@ -116,26 +118,29 @@ def _mdo(p: Params) -> list[Signaal]:
     return result
 
 
-def _minimum_uren(p: Params) -> list[Signaal]:
+def _afspraken(p: Params) -> list[Signaal]:
     details = []
     dl_pairs = list(p.req)
     totaal_per_e: dict[str, float] = {}
-    for (e, d, groep, l, uren) in p.min_uren:
+    for (e, d, groep, l, regel, uren) in p.afspraken:
+        naam = d or groep or "alle afdelingen"
+        doel = _min_uren_target_dl(p, dl_pairs, d, groep, l)
+        if not doel:
+            details.append(f"{e} – {naam}{f' ({l})' if l else ''}: deze afdeling bestaat niet op die locatie.")
+        if regel == "uitsluiten":
+            continue
         minimum = uren if uren is not None else MINIMUM_AANWEZIGHEID
         totaal_per_e[e] = totaal_per_e.get(e, 0) + minimum
-        naam = d or groep
-        if not _min_uren_target_dl(p, dl_pairs, d, groep, l):
-            details.append(f"{e} – {naam}{f' ({l})' if l else ''}: deze afdeling bestaat niet op die locatie.")
         dagen = p.werkdagen.get(e)
         if dagen and d is not None:
-            mdo = {p.mdo_dag.get(dl) for dl in _min_uren_target_dl(p, dl_pairs, d, groep, l)} - {None}
+            mdo = {dag for dl in doel for dag in p.mdo_dag.get(dl, ())}
             if mdo and not (mdo & dagen):
                 details.append(f"{e} – {naam}: moet hier werken, maar werkt niet op de MDO-dag.")
     for e, totaal in totaal_per_e.items():
         if totaal > p.avail.get(e, 0) + 1e-9:
-            details.append(f"{e}: minimaal {_uren(totaal)} uur verplicht, maar maar {_uren(p.avail.get(e, 0))} uur inzetbaar.")
+            details.append(f"{e}: minimaal {_uren(totaal)} uur afgesproken, maar maar {_uren(p.avail.get(e, 0))} uur inzetbaar.")
     if details:
-        return [Signaal("fout", "Sommige minimumuren (Extra eisen) zijn niet haalbaar.", details)]
+        return [Signaal("fout", "Sommige afspraken (Extra eisen) zijn niet haalbaar.", details)]
     return []
 
 
@@ -176,3 +181,35 @@ def _werkdagen(p: Params) -> list[Signaal]:
             zonder,
         )]
     return []
+
+
+def _nooit_samen(p: Params) -> list[Signaal]:
+    """Wie nu op twee locaties werkt die 'nooit' gecombineerd mogen worden,
+    krijgt sowieso een ander rooster. En een afspraak 'minimaal'/'precies' op
+    allebei die locaties maakt een planning onmogelijk."""
+    result: list[Signaal] = []
+    for a, b in p.nooit_samen:
+        locs: dict[str, set[str]] = {}
+        for (e, _d, l), uren in p.cur.items():
+            if uren > 0:
+                locs.setdefault(e, set()).add(l)
+        nu = sorted(e for e, s in locs.items() if {a, b} <= s)
+        if nu:
+            result.append(Signaal(
+                "info",
+                f"{len(nu)} medewerker(s) werken nu op {a} én {b}. Dat mag niet meer, dus hun rooster verandert; "
+                "dat telt mee als wijziging.",
+                nu,
+            ))
+        verplicht: dict[str, set[str]] = {}
+        for (e, _d, _g, l, regel, _u) in p.afspraken:
+            if regel in ("minimaal", "precies") and l is not None:
+                verplicht.setdefault(e, set()).add(l)
+        botsing = sorted(e for e, s in verplicht.items() if {a, b} <= s)
+        if botsing:
+            result.append(Signaal(
+                "fout",
+                f"Een afspraak (Extra eisen) dwingt iemand op {a} én {b}, terwijl die combinatie nooit mag.",
+                botsing,
+            ))
+    return result

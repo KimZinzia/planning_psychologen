@@ -1,11 +1,19 @@
-"""Lost het model lexicografisch op: eerst minimale afwijking van de huidige
-planning, dan binnen dat optimum minimale reistijd, dan binnen dat optimum
-minimaal aantal medewerkers per afdeling. Komt overeen met de Objective
-sectie (stap 1, 2, 3) van de wiskundige formulering.
+"""Lost het model lexicografisch op. Allereerst: zo veel mogelijk zorg dekken
+(bij te weinig formatie zo min mogelijk tekort, eerlijk verdeeld, afdelingen
+met voorrang zo min mogelijk gekort). Dan: basispsychologen liefst niet boven
+hun maximale bezetting (zie model.add_basis_constraints). Daarna vier doelen:
+1. zo min mogelijk wijzigingen ten opzichte van de huidige planning én zo
+   weinig mogelijk reizigers (even belangrijk, zie REIS_GEWICHT);
+2. bij afdelingen met meerdere MDO-dagen: liefst een gz-psycholoog die bij
+   alle MDO's is (zie model.add_mdo_constraints);
+3. de uren eerlijk verdelen: niet-gz liefst tussen hun minimum en maximum, gz rond hun
+   streefwaarde, binnen elke groep zo gelijk mogelijk (in halve uren);
+4. tot slot zo min mogelijk medewerkers per afdeling.
 
 Solver: HiGHS (open-source, via het pip-pakket highspy), aangestuurd via PuLP.
 """
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -15,16 +23,28 @@ import pulp
 from data import Params
 from model import CONSTRAINT_GROEPEN, Variabelen, build_model
 
-TIJDSLIMIET_PER_STAP = 120  # seconden
+TIJDSLIMIET_PER_STAP = 300  # seconden; meer tijd = grotere kans op het allerbeste rooster
 
 # Stappen van plan(), voor de voortgangsmelding. Elke stap duurt hooguit
 # TIJDSLIMIET_PER_STAP seconden.
 STAPPEN = [
     "Controleren of een planning mogelijk is",
-    "Zo min mogelijk wijzigingen",
-    "Zo min mogelijk reizen",
+    "Zo veel mogelijk zorg dekken",
+    "Basispsychologen niet te vol",
+    "Zo min mogelijk wijzigingen en reizen",
+    "Gz-psycholoog bij alle MDO's",
+    "Uren eerlijk verdelen",
     "Zo min mogelijk medewerkers per afdeling",
 ]
+
+# Doel 1 telt wijzigingen en reizigers op. Eén reiziger telt even zwaar als
+# REIS_GEWICHT wijzigingen (1 = even belangrijk). Hoger = reizen zwaarder
+# vermijden, ook als dat meer wijzigingen kost. Moet een geheel getal zijn.
+REIS_GEWICHT = 1
+
+# Het laatste doel (gelijk verdelen) rekent in procentpunten bezetting. Binnen 1
+# procentpunt van het best mogelijke is goed genoeg.
+GAP_VERDELING = 1.0
 Voortgang = Callable[[int, str], None]  # (stapnummer vanaf 1, omschrijving)
 
 
@@ -42,26 +62,33 @@ class OnoplosbaarError(RuntimeError):
         self.oorzaken = oorzaken
 
 
-def _solver(msg: bool = False, warm_start: bool = False):
+def _solver(msg: bool = False, warm_start: bool = False, zoekintensiteit: float | None = None, gap: float = 0.999):
     # Alle doelfuncties zijn gehele getallen (sommen van binaire variabelen).
     # Zodra gevonden oplossing en ondergrens minder dan 1 verschillen, is de
     # oplossing dus bewezen optimaal; verder zoeken is dan zinloos.
     # warm_start: begin bij de oplossing van de vorige stap. Die is ook geldig
     # voor de volgende stap; zonder dat vindt HiGHS soms lang niets.
-    return pulp.HiGHS(msg=msg, gapAbs=0.999, timeLimit=TIJDSLIMIET_PER_STAP, warmStart=warm_start)
+    # zoekintensiteit: hoeveel tijd HiGHS besteedt aan zoeken naar betere
+    # roosters (standaard 0.05). Hoger helpt bij doel 4 (mensen per
+    # afdeling), maar vertraagt doel 1; daarom alleen daar gebruikt.
+    extra = {} if zoekintensiteit is None else {"mip_heuristic_effort": zoekintensiteit}
+    # gap: voor de doelen met gehele getallen 0.999, voor het verdelen GAP_VERDELING.
+    return pulp.HiGHS(msg=msg, gapAbs=gap, timeLimit=TIJDSLIMIET_PER_STAP, warmStart=warm_start, **extra)
 
 
-def _los_op(model: pulp.LpProblem, stap: str, msg: bool, niet_bewezen: list[str]) -> float:
+def _los_op(
+    model: pulp.LpProblem, stap: str, msg: bool, niet_bewezen: list[str], zoekintensiteit: float | None = None,
+    gap: float = 0.999,
+) -> float:
     """Lost één stap op. Is de tijdslimiet bereikt maar is er wel een geldige
     planning gevonden, dan gaan we daarmee verder; de stap wordt dan genoteerd
     in `niet_bewezen` (mogelijk bestaat er een nog iets betere planning)."""
-    stats = model.solve(_solver(msg, warm_start=True))
+    stats = model.solve(_solver(msg, warm_start=True, zoekintensiteit=zoekintensiteit, gap=gap))
     if stats.status == pulp.LpSolveStatus.TimeLimit and stats.has_solution:
         niet_bewezen.append(stap)
     elif stats.status != pulp.LpSolveStatus.Optimal:
         raise RuntimeError(f"Stap '{stap}' niet opgelost: status {stats.status.name}")
-    # Alle drie de doelfuncties zijn sommen van binaire variabelen.
-    return round(pulp.value(model.objective))
+    return pulp.value(model.objective)
 
 
 def _ruim_op(p: Params, v: Variabelen, tol: float = 1e-6) -> None:
@@ -93,6 +120,21 @@ def _ruim_op(p: Params, v: Variabelen, tol: float = 1e-6) -> None:
         var.setInitialValue(1 if (e, l) in werkt_loc else 0)
     for e, var in v.w.items():
         var.setInitialValue(1 if (e, p.l1) in werkt_loc and (e, p.l2) in werkt_loc else 0)
+    for (d, l), var in v.tekort.items():
+        gedekt = sum(min(max(v.x[e, d, l].value() or 0, 0), v.ub[e, d, l]) for e in p.E)
+        tekort = min(max(p.req[d, l] - gedekt, 0.0), p.req[d, l])
+        if (d, l) in v.tekort_half:  # op halve uren naar boven (meer tekort noteren mag altijd)
+            tekort = min(math.ceil(2 * tekort - 1e-6) / 2, p.req[d, l])
+            v.tekort_half[d, l].setInitialValue(round(2 * tekort))
+        var.setInitialValue(tekort)
+    for e, var in v.boven_max.items():
+        uren = sum(min(max(v.x[e, d, l].value() or 0, 0), v.ub[e, d, l]) for (d, l) in v.dl_pairs)
+        var.setInitialValue(max(0.0, uren - p.max_bezetting_basis * p.avail[e]))
+    for (e, d, l), var in v.werkt.items():
+        var.setInitialValue(1 if (v.x[e, d, l].value() or 0) > tol else 0)
+    for (d, l), var in v.mdo_zonder_gz.items():
+        aanwezig = any((v.x[e, d, l].value() or 0) > tol for e in v.mdo_gz_geschikt[d, l])
+        var.setInitialValue(0 if aanwezig else 1)
 
 
 def _som(variabelen) -> int:
@@ -102,35 +144,235 @@ def _som(variabelen) -> int:
 def solve_lexicographic(
     model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool = False, voortgang: Voortgang = _geen_voortgang
 ) -> dict:
-    # --- Stap 1: minimaliseer afwijking van de huidige planning ---
-    afwijking = pulp.lpSum(v.z[e, d, l] for e in p.E for (d, l) in v.dl_pairs)
-    model.setObjective(afwijking)
     niet_bewezen: list[str] = []
-    voortgang(2, STAPPEN[1])
-    _los_op(model, "afwijking", msg, niet_bewezen)
-    _ruim_op(p, v)
-    z_star = _som(v.z.values())
-    model += afwijking <= z_star, "fix_deviation"
+    tekort = _dek_zorg(model, p, v, msg, niet_bewezen, voortgang)
 
-    # --- Stap 2: minimaliseer reistijd (aantal medewerkers op zowel l1 als l2) ---
+    # --- Dan: basispsychologen liefst niet boven hun maximale bezetting ---
+    boven_max: dict[str, float] = {}
+    if v.boven_max:
+        _ruim_op(p, v)
+        overschrijding = pulp.lpSum(v.boven_max.values())
+        model.setObjective(overschrijding)
+        voortgang(3, STAPPEN[2])
+        _los_op(model, "basispsychologen niet te vol", msg, niet_bewezen, gap=0.49)
+        _ruim_op(p, v)
+        waarde = pulp.value(overschrijding)
+        model += overschrijding <= waarde + 0.01, "fix_basis"
+        boven_max = {e: round(var.value() or 0, 1) for e, var in v.boven_max.items() if (var.value() or 0) > 0.05}
+
+    # --- Doel 1: wijzigingen en reizigers (op zowel l1 als l2), even belangrijk ---
+    afwijking = pulp.lpSum(v.z[e, d, l] for e in p.E for (d, l) in v.dl_pairs)
     reizen = pulp.lpSum(v.w[e] for e in p.E)
-    model.setObjective(reizen)
-    voortgang(3, STAPPEN[2])
-    _los_op(model, "reistijd", msg, niet_bewezen)
+    doel1 = afwijking + REIS_GEWICHT * reizen
+    model.setObjective(doel1)
+    voortgang(4, STAPPEN[3])
+    _los_op(model, "wijzigingen en reizen", msg, niet_bewezen)
     _ruim_op(p, v)
-    w_star = _som(v.w.values())
-    model += reizen <= w_star, "fix_travel"
+    z_star, w_star = _som(v.z.values()), _som(v.w.values())
+    model += doel1 <= z_star + REIS_GEWICHT * w_star, "fix_doel1"
 
-    # --- Stap 3: minimaliseer aantal medewerkers per afdeling ---
+    # --- Doel 2: liefst een gz-psycholoog bij alle MDO's (alleen afdelingen met meerdere MDO-dagen) ---
+    zonder_gz = 0
+    if v.mdo_zonder_gz:
+        mdo_doel = pulp.lpSum(v.mdo_zonder_gz.values())
+        model.setObjective(mdo_doel)
+        voortgang(5, STAPPEN[4])
+        _los_op(model, "gz bij MDO's", msg, niet_bewezen)
+        _ruim_op(p, v)
+        zonder_gz = _som(v.mdo_zonder_gz.values())
+        model += mdo_doel <= zonder_gz, "fix_mdo_gz"
+
+    # --- Doel 3: uren eerlijk verdelen (niet-gz minimum, gz streefwaarde, binnen groepen gelijk) ---
+    # Vóór 'mensen per afdeling': gemeten op de echte invoer sneller, en een
+    # eerlijkere verdeling van de uren.
+    voortgang(6, STAPPEN[5])
+    _verdeel_gelijk(model, p, v, msg, niet_bewezen)
+
+    # --- Doel 4: minimaliseer aantal medewerkers per afdeling ---
     # AGT telt hier bewust niet mee: meerdere collega's op AGT is prima
     # (soms zelfs prettig), dus die afdeling wordt hier uitgezonderd.
-    model.setObjective(pulp.lpSum(v.y[e, d] for e in p.E for d in p.D if d != "AGT"))
-    voortgang(4, STAPPEN[3])
-    _los_op(model, "aantal medewerkers", msg, niet_bewezen)
+    aantal = pulp.lpSum(v.y[e, d] for e in p.E for d in p.D if d != "AGT")
+    model.setObjective(aantal)
+    voortgang(7, STAPPEN[6])
+    _los_op(model, "aantal medewerkers", msg, niet_bewezen, zoekintensiteit=0.3)
     _ruim_op(p, v)
     headcount = _som(var for (e, d), var in v.y.items() if d != "AGT")
+    laag, hoog = bezetting_bereik(p, extract_schedule(p, v))
 
-    return {"deviation": z_star, "travel": w_star, "headcount": headcount, "niet_bewezen_optimaal": niet_bewezen}
+    return {
+        "deviation": z_star, "travel": w_star, "headcount": headcount,
+        "bezetting_laag": laag, "bezetting_hoog": hoog, "mdo_zonder_gz": sorted(
+            f"{d} ({l})" for (d, l), var in v.mdo_zonder_gz.items() if round(var.value() or 0) == 1
+        ) if zonder_gz else [],
+        "boven_max_basis": boven_max,
+        "tekort": tekort,
+        "niet_bewezen_optimaal": niet_bewezen,
+    }
+
+
+def _dek_zorg(
+    model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool, niet_bewezen: list[str], voortgang: Voortgang
+) -> dict[str, float]:
+    """Allereerste stap: zo veel mogelijk zorg dekken. Normaal is het tekort 0
+    (dan is deze stap snel klaar). Is er te weinig formatie, dan:
+    a. zo min mogelijk tekort in totaal;
+    b. afdelingen met voorrang zo min mogelijk gekort;
+    c. de overige afdelingen eerlijk: het hoogste tekort (in procenten van de
+       vereiste uren) zo laag mogelijk.
+    Geeft het tekort per afdeling terug ('Afdeling (locatie)' -> uren)."""
+    voortgang(2, STAPPEN[1])
+    _ruim_op(p, v)
+    totaal = pulp.lpSum(v.tekort.values())
+    model.setObjective(totaal)
+    _los_op(model, "zorg dekken", msg, niet_bewezen, gap=0.01)
+    _ruim_op(p, v)
+    waarde = pulp.value(totaal) or 0
+    if waarde <= 0.01:
+        model += totaal <= 1e-6, "geen_tekort"
+        return {}
+    # Er is een tekort. Reken dat in halve uren (anders wordt het in snippers van
+    # 0,2 uur over alle afdelingen verdeeld, en past het rooster later niet meer
+    # in halve uren), en zoek het kleinste tekort opnieuw op dat raster.
+    for i, ((d, l), var) in enumerate(v.tekort.items()):
+        halve = model.add_variable(f"tekort_halfuur_{i}", lowBound=0, upBound=int(2 * p.req[d, l] + 1e-9), cat="Integer")
+        v.tekort_half[d, l] = halve
+        model += var == 0.5 * halve
+    _ruim_op(p, v)
+    _los_op(model, "zorg dekken", msg, niet_bewezen, gap=0.49)
+    _ruim_op(p, v)
+    waarde = pulp.value(totaal) or 0
+    model += totaal <= waarde + 1e-4, "fix_tekort"
+
+    voorrang = [dl for dl in v.tekort if p.voorrang.get(dl)]
+    if voorrang:  # b
+        som = pulp.lpSum(v.tekort[dl] for dl in voorrang)
+        model.setObjective(som)
+        _los_op(model, "tekort bij voorrang", msg, niet_bewezen, gap=0.01)
+        _ruim_op(p, v)
+        model += som <= (pulp.value(som) or 0) + 1e-4, "fix_tekort_voorrang"
+    overig = [dl for dl in v.tekort if not p.voorrang.get(dl) and p.req[dl] > 0]
+    if overig:  # c
+        hoogste = model.add_variable("tekort_hoogste_pct", lowBound=0, upBound=100)
+        for dl in overig:
+            model += v.tekort[dl] * (100.0 / p.req[dl]) <= hoogste
+        model.setObjective(hoogste)
+        _los_op(model, "tekort eerlijk verdelen", msg, niet_bewezen, gap=0.5)
+        _ruim_op(p, v)
+        model += hoogste <= (hoogste.value() or 0) + 0.01, "fix_tekort_eerlijk"
+    return {
+        f"{d} ({l})": round(var.value() or 0, 1) for (d, l), var in v.tekort.items() if (var.value() or 0) > 0.05
+    }
+
+
+def _verdeel_gelijk(model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool, niet_bewezen: list[str]) -> None:
+    """Doel 3: de uren verdelen. Bezetting = ingeplande uren / inzetbare uren,
+    in procenten. Medewerkers met 0 inzetbare uren tellen niet mee.
+
+    In drie stappen, allemaal voorkeuren (geen harde grenzen):
+    a. Medewerkers zonder gz-registratie liefst tussen p.min_bezetting_niet_gz
+       en p.max_bezetting_niet_gz (bv. 75% en 85%): zo min mogelijk uren
+       eronder of erboven.
+    b. Gz-psychologen zo dicht mogelijk bij p.streef_bezetting_gz (bv. 90%):
+       zo min mogelijk uren afwijking, naar boven of naar beneden.
+    c. Daarna binnen elke groep (gz en niet-gz) zo gelijk mogelijk: het
+       verschil tussen hoogste en laagste bezetting, opgeteld over beide groepen.
+    Elke stap houdt de uitkomst van de vorige vast.
+
+    De uitkomst van doel 1 en 2 blijft daarbij gelijk (die zijn vastgezet), en
+    er komen geen uren bij: er wordt alleen geschoven. Omdat dat anders 'rare'
+    aantallen geeft (5,8 uur), rekent deze stap in halve uren. Lukt dat niet
+    (bv. door een afspraak van 4,25 uur), dan blijft de planning van doel 2 staan.
+
+    De uitkomst wordt vastgezet, zodat doel 4 (mensen per afdeling) de verdeling
+    niet meer verschuift.
+    """
+    medewerkers = [e for e in p.E if p.avail[e] > 0]
+    if len(medewerkers) < 2:
+        return
+    vorige = {k: var.value() for k, var in v.x.items()}
+    for i, ((e, d, l), var) in enumerate(v.x.items()):
+        halve = model.add_variable(f"halfuur_{i}", lowBound=0, upBound=int(2 * v.ub[e, d, l] + 1e-9), cat="Integer")
+        halve.setInitialValue(round(2 * (vorige[e, d, l] or 0)))
+        model += var == 0.5 * halve
+    # Gelijk verdelen mag alleen uren verschuiven, niet toevoegen. Anders is
+    # 'iedereen 100%' de makkelijkste oplossing: meer uren dan de afdelingen
+    # nodig hebben. (Afgerond op halve uren naar boven, zodat de planning van
+    # de vorige stap altijd past.)
+    totaal_voor = sum(w or 0 for w in vorige.values())
+    model += pulp.lpSum(v.x.values()) <= math.ceil(2 * totaal_voor - 1e-6) / 2, "geen_extra_uren"
+
+    def bezetting(e):
+        return pulp.lpSum(v.x[e, d, l] for (d, l) in v.dl_pairs) * (100.0 / p.avail[e])
+
+    groepen = {
+        "gz": [e for e in medewerkers if p.gz.get(e, 0) == 1],
+        "overig": [e for e in medewerkers if p.gz.get(e, 0) != 1],
+    }
+    spreiding = []
+    for naam, groep in groepen.items():
+        if not groep:
+            continue
+        hoog = model.add_variable(f"bezetting_hoog_{naam}", lowBound=0)
+        laag = model.add_variable(f"bezetting_laag_{naam}", lowBound=0)
+        for e in groep:
+            model += bezetting(e) <= hoog
+            model += bezetting(e) >= laag
+        spreiding.append(hoog - laag)
+
+    def uren(e):
+        return pulp.lpSum(v.x[e, d, l] for (d, l) in v.dl_pairs)
+
+    # a. niet-gz liefst tussen de minimale en maximale bezetting
+    onder = {}
+    for i, e in enumerate(groepen["overig"]):
+        onder[e] = model.add_variable(f"onder_min_{i}", lowBound=0)
+        model += uren(e) + onder[e] >= p.min_bezetting_niet_gz * p.avail[e]
+        onder[e, "boven"] = model.add_variable(f"boven_max_ng_{i}", lowBound=0)
+        model += uren(e) - p.max_bezetting_niet_gz * p.avail[e] <= onder[e, "boven"]
+    # b. gz zo dicht mogelijk bij de streefbezetting
+    afwijking = {}
+    for i, e in enumerate(groepen["gz"]):
+        afwijking[e] = model.add_variable(f"afwijking_gz_{i}", lowBound=0)
+        model += uren(e) - p.streef_bezetting_gz * p.avail[e] <= afwijking[e]
+        model += p.streef_bezetting_gz * p.avail[e] - uren(e) <= afwijking[e]
+
+    try:
+        for naam, termen in [("niet-gz tussen min en max", onder), ("gz rond streefwaarde", afwijking)]:
+            if not termen:
+                continue
+            som = pulp.lpSum(termen.values())
+            model.setObjective(som)
+            _los_op(model, naam, msg, niet_bewezen, gap=0.49)
+            _ruim_op(p, v)
+            model += som <= (pulp.value(som) or 0) + 0.01, f"fix_{naam.replace(' ', '_')}"
+        # c. binnen elke groep zo gelijk mogelijk
+        verschil = pulp.lpSum(spreiding)
+        model.setObjective(verschil)
+        _los_op(model, "gelijke verdeling", msg, niet_bewezen, gap=GAP_VERDELING)
+        _ruim_op(p, v)
+        model += verschil <= (pulp.value(verschil) or 0) + GAP_VERDELING, "fix_verdeling"
+    except RuntimeError:
+        # Geen planning in halve uren gevonden: terug naar de planning van doel 2.
+        for k, var in v.x.items():
+            var.varValue = vorige[k]
+        niet_bewezen.append("gelijke verdeling")
+
+
+def bezetting_per_medewerker(p: Params, rooster: pd.DataFrame) -> pd.DataFrame:
+    """Per medewerker: inzetbare uren, ingeplande uren en bezetting (%)."""
+    gepland = rooster.groupby("medewerker")["uren"].sum() if len(rooster) else pd.Series(dtype=float)
+    rijen = [
+        {"medewerker": e, "inzetbaar": p.avail[e], "gepland": float(gepland.get(e, 0.0)),
+         "bezetting": 100.0 * float(gepland.get(e, 0.0)) / p.avail[e]}
+        for e in p.E if p.avail[e] > 0
+    ]
+    return pd.DataFrame(rijen, columns=["medewerker", "inzetbaar", "gepland", "bezetting"])
+
+
+def bezetting_bereik(p: Params, rooster: pd.DataFrame) -> tuple[int, int]:
+    """Laagste en hoogste bezetting (afgerond op hele procenten)."""
+    b = bezetting_per_medewerker(p, rooster)["bezetting"]
+    return (round(b.min()), round(b.max())) if len(b) else (0, 0)
 
 
 def is_oplosbaar(p: Params, uitzetten: frozenset[str] = frozenset()) -> bool:

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from data import TABELLEN, normaliseer_tabellen
+from data import OUDE_TABELLEN, TABELLEN, normaliseer_tabellen
 
 STANDAARD_PAD = Path(__file__).resolve().parent.parent / "data" / "planning.db"
 
@@ -46,9 +46,14 @@ def heeft_gegevens() -> bool:
 def lees_tabellen() -> dict[str, pd.DataFrame]:
     """Alle invoertabellen (ontbrekende tabellen komen terug als lege tabel)."""
     with closing(_verbind()) as con:
+        namen = list(TABELLEN)
+        if not _tabel_bestaat(con, "Afspraken"):
+            # Database van vóór de tabel Afspraken: de oude tabellen worden bij
+            # het normaliseren omgezet. Ze blijven zelf ongewijzigd staan.
+            namen += OUDE_TABELLEN
         tabellen = {
             naam: pd.read_sql(f'SELECT * FROM "{naam}"', con) if _tabel_bestaat(con, naam) else None
-            for naam in TABELLEN
+            for naam in namen
         }
     return normaliseer_tabellen(tabellen)
 

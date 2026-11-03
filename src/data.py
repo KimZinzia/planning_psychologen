@@ -12,9 +12,12 @@ namen en kolommen als de tabbladen van planning_input.xlsx:
 - Requirements:    locatie, afdeling, vereiste_uren, alleen_gz_psycholoog,
                    max_medewerkers, afdelingsgroep.
 - CurrentSchedule: medewerker, afdeling, locatie, huidige_uren.
-- MinimumUren:     medewerker, afdeling óf afdelingsgroep, locatie, uren.
-- Config:          key/value met locatie_1 en locatie_2 (het reispaar).
-- Bijsturing:      medewerker, afdeling, locatie, actie, uren (alleen app).
+- Afspraken:       medewerker, afdeling óf afdelingsgroep (of geen van beide =
+                   hele locatie), locatie, regel (minimaal/precies/uitsluiten),
+                   uren. Vervangt de oude tabellen MinimumUren en Bijsturing,
+                   die bij het lezen automatisch worden omgezet.
+- Config:          key/value met locatie_1 en locatie_2 (het reispaar: liever
+                   niet combineren) en nooit_1 en nooit_2 (nooit combineren).
 
 Die tabellen komen óf uit het Excel-bestand (load_excel_tables, gebruikt door
 het notebook), óf uit de database van de app (store.py). params_from_tables
@@ -31,13 +34,14 @@ doen", "max 1 medewerker op Lotus 2") staan niet hardcoded in model.py:
 - Requirements.afdelingsgroep: label (bv. "GRZ") waarmee afdelingen aan
   elkaar gekoppeld worden; een medewerker die in zo'n groep werkt, moet dat
   op één locatie doen (zie constraint 9 in model.py).
-- MinimumUren: verplicht minimumaantal uren per medewerker, voor een
-  afdeling óf een afdelingsgroep (precies één van de twee invullen), optioneel
-  toegespitst op een locatie. Uren leeg laten betekent: moet er zijn, aantal
-  maakt niet uit.
+- Afspraken: per medewerker 'minimaal X uur', 'precies X uur' of
+  'uitsluiten', voor een afdeling, een afdelingsgroep of een hele locatie.
+  Uren leeg bij 'minimaal' betekent: moet er werken, aantal maakt niet uit.
 """
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -61,28 +65,57 @@ AFTREK_KOLOMMEN = [
 # Productiviteit van een medewerker in opleiding (PIOG): telt voor 75%.
 PIOG_PRODUCTIVITEIT = 0.75
 
+# Basispsychologen (geen gz, niet in opleiding) liefst niet voller dan dit deel
+# van hun inzetbare uren. Standaardwaarde; in te stellen in de app (Config).
+MAX_BEZETTING_BASIS = 0.85
+# Streefwaarden bij het verdelen van de uren (sterke voorkeur, geen harde grens):
+# gz-psychologen zo dicht mogelijk bij STREEF_BEZETTING_GZ, de anderen liefst
+# niet onder MIN_BEZETTING_NIET_GZ. In te stellen in de app (Config).
+STREEF_BEZETTING_GZ = 0.90
+MIN_BEZETTING_NIET_GZ = 0.75
+MAX_BEZETTING_NIET_GZ = 0.85
+
 # Werkdagen van een medewerker. Het model plant per week, maar gebruikt de
 # werkdagen voor de MDO's: wie op een afdeling werkt, moet werken op de dag
-# van het MDO van die afdeling (Requirements.mdo_dag, constraint 12).
+# van het MDO van die afdeling (Requirements.mdo_dag, constraint 11). Een
+# afdeling kan meerdere MDO-dagen hebben (bv. 'di,do'), zie model.py.
 WERKDAGEN = ["ma", "di", "wo", "do", "vr"]
 DAG_NAMEN = {"ma": "maandag", "di": "dinsdag", "wo": "woensdag", "do": "donderdag", "vr": "vrijdag"}
 
-TABELLEN = ["Employees", "Locaties", "Requirements", "CurrentSchedule", "MinimumUren", "Config", "Bijsturing"]
+TABELLEN = [
+    "Employees", "Locaties", "Requirements", "CurrentSchedule", "Afspraken", "Config",
+    # Noodplanning: tijdelijke aanpassingen met een einddatum (zie pas_tijdelijk_toe)
+    "TijdelijkAfdeling", "TijdelijkMedewerker", "TijdelijkRegels",
+]
+# Oude tabellen (vóór november 2026); worden bij het lezen omgezet naar Afspraken.
+OUDE_TABELLEN = ["MinimumUren", "Bijsturing"]
 
 KOLOMMEN = {
     "Employees": ["medewerker", "gz_psycholoog", "In opleiding", "Contracturen", *AFTREK_KOLOMMEN, "zwangerschapsverlof", *WERKDAGEN],
     "Locaties": ["locatie"],
-    "Requirements": ["locatie", "afdeling", "vereiste_uren", "alleen_gz_psycholoog", "max_medewerkers", "afdelingsgroep", "mdo_dag"],
+    "Requirements": ["locatie", "afdeling", "vereiste_uren", "alleen_gz_psycholoog", "max_medewerkers", "afdelingsgroep", "mdo_dag", "voorrang"],
     "CurrentSchedule": ["medewerker", "afdeling", "locatie", "huidige_uren"],
-    "MinimumUren": ["medewerker", "afdeling", "afdelingsgroep", "locatie", "uren"],
+    "Afspraken": ["medewerker", "afdeling", "afdelingsgroep", "locatie", "regel", "uren"],
     "Config": ["key", "value"],
-    "Bijsturing": ["medewerker", "afdeling", "locatie", "actie", "uren"],
+    "TijdelijkAfdeling": ["afdeling", "locatie", "uren", "tot", "notitie"],
+    "TijdelijkMedewerker": ["medewerker", "uren_erbij", "tot", "notitie"],
+    "TijdelijkRegels": ["regel", "tot", "notitie"],
 }
 
-BIJSTURING_ACTIES = ["vastzetten", "uitsluiten"]
+# Regels die in de noodplanning tijdelijk losgelaten mogen worden.
+LOSLAATBARE_REGELS = {
+    "nooit_combineren": "Nooit combineren (locaties)",
+    "max_medewerkers": "Max. medewerkers per afdeling",
+}
+
+# Regels in de tabel Afspraken:
+# - minimaal:   e werkt daar minstens 'uren' uur (leeg = moet er werken, aantal maakt niet uit);
+# - precies:    e werkt daar precies 'uren' uur;
+# - uitsluiten: e werkt daar niet.
+REGELS = ["minimaal", "precies", "uitsluiten"]
 
 # Kolommen die tekst bevatten (namen, labels, dagen); de rest is numeriek.
-TEKST_KOLOMMEN = {"medewerker", "afdeling", "locatie", "afdelingsgroep", "mdo_dag", "actie", "key", "value"}
+TEKST_KOLOMMEN = {"medewerker", "afdeling", "locatie", "afdelingsgroep", "mdo_dag", "regel", "key", "value", "tot", "notitie"}
 
 
 @dataclass
@@ -97,17 +130,30 @@ class Params:
     gz_only: dict[tuple[str, str], int]     # gz_only[d, l], default 0
     max_medewerkers: dict[str, int]         # max_medewerkers[d], default geen cap
     afdelingsgroep: dict[str, str]          # afdelingsgroep[d], default geen groep
-    # (medewerker, afdeling of None, afdelingsgroep of None, locatie of None, uren of None)
-    # precies één van afdeling/afdelingsgroep is gezet; uren=None => moet er zijn, aantal maakt niet uit
-    min_uren: list[tuple[str, str | None, str | None, str | None, float | None]]
     l1: str  # eerste locatie van het te vermijden reispaar
     l2: str  # tweede locatie van het te vermijden reispaar
-    # (medewerker, afdeling, locatie of None, 'vastzetten'/'uitsluiten', uren of None)
-    bijsturing: list[tuple[str, str, str | None, str, float | None]] = field(default_factory=list)
+    # (medewerker, afdeling of None, afdelingsgroep of None, locatie of None, regel, uren of None)
+    # afdeling en groep allebei None => hele locatie. Regel: zie REGELS.
+    afspraken: list[tuple[str, str | None, str | None, str | None, str, float | None]] = field(default_factory=list)
     # werkdagen[e]: dagen waarop e werkt; leeg = onbekend (geen beperking)
     werkdagen: dict[str, set[str]] = field(default_factory=dict)
-    # mdo_dag[d, l]: dag van het MDO van afdeling d op locatie l; ontbreekt = geen MDO
-    mdo_dag: dict[tuple[str, str], str] = field(default_factory=dict)
+    # mdo_dag[d, l]: dag(en) van het MDO van afdeling d op locatie l, bv. ('di', 'do'); ontbreekt = geen MDO
+    mdo_dag: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+    # Locatieparen die één medewerker nooit mag combineren (harde eis), bv. ONO en RK
+    nooit_samen: list[tuple[str, str]] = field(default_factory=list)
+    # in_opleiding[e]: 1 = PIOG
+    in_opleiding: dict[str, int] = field(default_factory=dict)
+    # Basispsychologen (geen gz, niet in opleiding): liefst niet voller dan dit deel van hun inzetbare uren
+    max_bezetting_basis: float = MAX_BEZETTING_BASIS
+    streef_bezetting_gz: float = STREEF_BEZETTING_GZ
+    min_bezetting_niet_gz: float = MIN_BEZETTING_NIET_GZ
+    max_bezetting_niet_gz: float = MAX_BEZETTING_NIET_GZ
+    # voorrang[d, l] = 1: bij een tekort aan uren zo min mogelijk korten
+    voorrang: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Vereiste uren zonder tijdelijke aanpassingen (alleen voor weergave)
+    req_normaal: dict[tuple[str, str], float] = field(default_factory=dict)
+    # Actieve tijdelijke aanpassingen (noodplanning), als leesbare zinnen
+    tijdelijk: list[str] = field(default_factory=list)
 
 
 def bereken_uren_opbouw(employees: pd.DataFrame) -> pd.DataFrame:
@@ -146,9 +192,38 @@ def _leeg_naar_none(waarde):
     return waarde
 
 
+def oude_naar_afspraken(minimum: pd.DataFrame | None, bijsturing: pd.DataFrame | None) -> pd.DataFrame:
+    """Zet de oude tabellen MinimumUren en Bijsturing om naar Afspraken.
+
+    - minimumuren                -> minimaal (uren blijven gelijk);
+    - vastzetten zonder uren     -> minimaal zonder uren (moet er werken);
+    - vastzetten met uren        -> precies;
+    - uitsluiten                 -> uitsluiten.
+    Betekenis en uitkomst van de planning blijven daarbij precies hetzelfde.
+    """
+    rijen = []
+    if minimum is not None:
+        for r in minimum.to_dict("records"):
+            rijen.append({"medewerker": r.get("medewerker"), "afdeling": r.get("afdeling"),
+                          "afdelingsgroep": r.get("afdelingsgroep"), "locatie": r.get("locatie"),
+                          "regel": "minimaal", "uren": r.get("uren")})
+    if bijsturing is not None:
+        for r in bijsturing.to_dict("records"):
+            uren = _leeg_naar_none(r.get("uren"))
+            if r.get("actie") == "uitsluiten":
+                regel, uren = "uitsluiten", None
+            else:
+                regel = "minimaal" if uren is None else "precies"
+            rijen.append({"medewerker": r.get("medewerker"), "afdeling": r.get("afdeling"), "afdelingsgroep": None,
+                          "locatie": r.get("locatie"), "regel": regel, "uren": uren})
+    return pd.DataFrame(rijen, columns=KOLOMMEN["Afspraken"])
+
+
 def normaliseer_tabellen(tabellen: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     """Zorgt dat elke tabel bestaat en alle verwachte kolommen heeft (lege
     optionele kolommen worden aangevuld), en verwijdert lege rijen."""
+    if tabellen.get("Afspraken") is None and any(tabellen.get(n) is not None for n in OUDE_TABELLEN):
+        tabellen = {**tabellen, "Afspraken": oude_naar_afspraken(tabellen.get("MinimumUren"), tabellen.get("Bijsturing"))}
     result = {}
     for naam in TABELLEN:
         df = tabellen.get(naam)
@@ -181,10 +256,17 @@ def load_excel_tables(path) -> dict[str, pd.DataFrame]:
         # Ouder formaat (bv. toy_example.xlsx): alleen 'Inzetbare tijd', geen
         # opbouw uit contracturen. Dan zijn de contracturen gelijk daaraan.
         sheets["Employees"] = employees.assign(Contracturen=employees["Inzetbare tijd"])
-    return normaliseer_tabellen({naam: sheets.get(naam) for naam in TABELLEN})
+    return normaliseer_tabellen({naam: sheets.get(naam) for naam in [*TABELLEN, *OUDE_TABELLEN]})
 
 
-def params_from_tables(tabellen: dict[str, pd.DataFrame]) -> Params:
+def params_from_tables(tabellen: dict[str, pd.DataFrame], peildatum: date | None = None) -> Params:
+    """Tabellen -> Params, inclusief de tijdelijke aanpassingen (noodplanning)
+    die op `peildatum` (standaard vandaag) nog gelden."""
+    p = _params_zonder_tijdelijk(tabellen)
+    return pas_tijdelijk_toe(p, normaliseer_tabellen(tabellen), peildatum or date.today())
+
+
+def _params_zonder_tijdelijk(tabellen: dict[str, pd.DataFrame]) -> Params:
     t = normaliseer_tabellen(tabellen)
     employees, requirements = t["Employees"], t["Requirements"]
     config = t["Config"].set_index("key")["value"]
@@ -222,26 +304,16 @@ def params_from_tables(tabellen: dict[str, pd.DataFrame]) -> Params:
         if _leeg_naar_none(row.huidige_uren) is not None
     }
 
-    min_uren = [
+    afspraken = [
         (
             row.medewerker,
             _leeg_naar_none(row.afdeling),
             _leeg_naar_none(row.afdelingsgroep),
             _leeg_naar_none(row.locatie),
+            row.regel,
             None if _leeg_naar_none(row.uren) is None else float(row.uren),
         )
-        for row in t["MinimumUren"].itertuples()
-    ]
-
-    bijsturing = [
-        (
-            row.medewerker,
-            row.afdeling,
-            _leeg_naar_none(row.locatie),
-            row.actie,
-            None if _leeg_naar_none(row.uren) is None else float(row.uren),
-        )
-        for row in t["Bijsturing"].itertuples()
+        for row in t["Afspraken"].itertuples()
     ]
 
     return Params(
@@ -255,20 +327,133 @@ def params_from_tables(tabellen: dict[str, pd.DataFrame]) -> Params:
         gz_only=gz_only,
         max_medewerkers=max_medewerkers,
         afdelingsgroep=afdelingsgroep,
-        min_uren=min_uren,
         l1=config.get("locatie_1"),
         l2=config.get("locatie_2"),
-        bijsturing=bijsturing,
+        afspraken=afspraken,
         werkdagen={
             str(row.medewerker): {d for d in WERKDAGEN if pd.to_numeric(getattr(row, d), errors="coerce") == 1}
             for row in employees.itertuples()
         },
         mdo_dag={
-            (row.afdeling, row.locatie): str(row.mdo_dag).strip().lower()[:2]
+            (row.afdeling, row.locatie): mdo_dagen(row.mdo_dag)
             for row in requirements.itertuples()
-            if _leeg_naar_none(row.mdo_dag) is not None
+            if mdo_dagen(row.mdo_dag)
         },
+        nooit_samen=_nooit_samen(config),
+        in_opleiding=dict(zip(E, pd.to_numeric(employees["In opleiding"], errors="coerce").fillna(0).astype(int))),
+        max_bezetting_basis=_percentage(config, "max_bezetting_basis", MAX_BEZETTING_BASIS),
+        streef_bezetting_gz=_percentage(config, "streef_bezetting_gz", STREEF_BEZETTING_GZ),
+        min_bezetting_niet_gz=_percentage(config, "min_bezetting_niet_gz", MIN_BEZETTING_NIET_GZ),
+        max_bezetting_niet_gz=_percentage(config, "max_bezetting_niet_gz", MAX_BEZETTING_NIET_GZ),
+        voorrang={
+            (row.afdeling, row.locatie): 1
+            for row in requirements.itertuples()
+            if pd.to_numeric(row.voorrang, errors="coerce") == 1
+        },
+        req_normaal=dict(req),
     )
+
+
+def mdo_dagen(waarde) -> tuple[str, ...]:
+    """'di,do' / 'Dinsdag en donderdag' / ['di', 'do'] -> ('di', 'do'); leeg -> ().
+    Onbekende woorden blijven staan (2 letters), zodat valideer() ze meldt."""
+    if waarde is None or (not isinstance(waarde, (str, list, tuple)) and pd.isna(waarde)):
+        return ()
+    delen = waarde if isinstance(waarde, (list, tuple)) else re.split(r"[^a-z]+", str(waarde).lower())
+    dagen = []
+    for deel in delen:
+        deel = str(deel).strip().lower()
+        if deel and deel != "en" and deel[:2] not in dagen:
+            dagen.append(deel[:2])
+    volgorde = {d: i for i, d in enumerate(WERKDAGEN)}
+    return tuple(sorted(dagen, key=lambda d: volgorde.get(d, 99)))
+
+
+def mdo_tekst(dagen) -> str | None:
+    """('di', 'do') -> 'di,do' (zo staat het in de database); leeg -> None."""
+    dagen = mdo_dagen(dagen)
+    return ",".join(dagen) if dagen else None
+
+
+def lees_datum(waarde) -> date | None:
+    """'2026-12-01' (zo staat het in de database) of een date -> date; anders None."""
+    if isinstance(waarde, date):
+        return waarde
+    if _leeg_naar_none(waarde) is None:
+        return None
+    try:
+        return date.fromisoformat(str(waarde)[:10])
+    except ValueError:
+        return None
+
+
+def _nl_datum(d: date) -> str:
+    return f"{d:%d-%m-%Y}"
+
+
+def _getal(x: float) -> str:
+    return f"{x:g}".replace(".", ",")
+
+
+def pas_tijdelijk_toe(p: Params, t: dict[str, pd.DataFrame], peildatum: date) -> Params:
+    """Noodplanning: past de tijdelijke aanpassingen toe die op `peildatum` nog
+    gelden (einddatum 'tot en met' >= peildatum). Verlopen of onvolledige regels
+    worden genegeerd. De basisinvoer zelf blijft onaangeroerd.
+
+    - TijdelijkAfdeling:   afdeling (op locatie) krijgt tijdelijk 'uren' vereist;
+    - TijdelijkMedewerker: inzetbare uren + 'uren_erbij' (negatief = minder);
+    - TijdelijkRegels:     regel uit LOSLAATBARE_REGELS geldt tijdelijk niet.
+    """
+    req, avail = dict(p.req), dict(p.avail)
+    nooit_samen, max_medewerkers = list(p.nooit_samen), dict(p.max_medewerkers)
+    zinnen = []
+
+    def actief(rij) -> date | None:
+        tot = lees_datum(rij["tot"])
+        return tot if tot is not None and tot >= peildatum else None
+
+    for rij in t["TijdelijkAfdeling"].to_dict("records"):
+        tot, d, l = actief(rij), rij["afdeling"], rij["locatie"]
+        uren = pd.to_numeric(rij["uren"], errors="coerce")
+        if tot is None or pd.isna(uren) or (d, l) not in req:
+            continue
+        zinnen.append(f"{d} ({l}): {_getal(float(uren))} uur in plaats van {_getal(req[d, l])} (t/m {_nl_datum(tot)})")
+        req[d, l] = max(float(uren), 0.0)
+    for rij in t["TijdelijkMedewerker"].to_dict("records"):
+        tot, e = actief(rij), rij["medewerker"]
+        erbij = pd.to_numeric(rij["uren_erbij"], errors="coerce")
+        if tot is None or pd.isna(erbij) or e not in avail:
+            continue
+        nieuw = max(avail[e] + float(erbij), 0.0)
+        zinnen.append(f"{e}: {_getal(nieuw)} uur inzetbaar in plaats van {_getal(avail[e])} (t/m {_nl_datum(tot)})")
+        avail[e] = nieuw
+    for rij in t["TijdelijkRegels"].to_dict("records"):
+        tot, regel = actief(rij), rij["regel"]
+        if tot is None or regel not in LOSLAATBARE_REGELS:
+            continue
+        zinnen.append(f"Regel '{LOSLAATBARE_REGELS[regel]}' geldt tijdelijk niet (t/m {_nl_datum(tot)})")
+        if regel == "nooit_combineren":
+            nooit_samen = []
+        elif regel == "max_medewerkers":
+            max_medewerkers = {}
+    return replace(p, req=req, avail=avail, nooit_samen=nooit_samen, max_medewerkers=max_medewerkers, tijdelijk=zinnen)
+
+
+def _percentage(config, sleutel: str, standaard: float) -> float:
+    """Config-percentage (bv. '85') -> 0.85; leeg of onleesbaar = standaard."""
+    waarde = pd.to_numeric(config.get(sleutel), errors="coerce")
+    return standaard if pd.isna(waarde) else float(waarde) / 100
+
+
+def is_basispsycholoog(p: "Params", e: str) -> bool:
+    """Geen gz-psycholoog en niet in opleiding."""
+    return p.gz.get(e, 0) != 1 and p.in_opleiding.get(e, 0) != 1
+
+
+def _nooit_samen(config) -> list[tuple[str, str]]:
+    """Config nooit_1/nooit_2 -> [(a, b)]; leeg als niet (volledig) ingevuld."""
+    a, b = _leeg_naar_none(config.get("nooit_1")), _leeg_naar_none(config.get("nooit_2"))
+    return [(str(a), str(b))] if a is not None and b is not None else []
 
 
 def load_data(path: str | Path) -> Params:
@@ -289,32 +474,40 @@ def valideer(p: Params) -> list[str]:
     for naam, loc in [("locatie_1", p.l1), ("locatie_2", p.l2)]:
         if loc not in L:
             fouten.append(f"Instelling {naam} = '{loc}' is geen bekende locatie ({', '.join(sorted(L))}).")
+    for a, b in p.nooit_samen:
+        if a == b:
+            fouten.append("Instelling 'nooit combineren': kies twee verschillende locaties.")
+        for loc in (a, b):
+            if loc not in L:
+                fouten.append(f"Instelling 'nooit combineren': '{loc}' is geen bekende locatie.")
+        if {a, b} == {p.l1, p.l2}:
+            fouten.append(f"{a} en {b} staan zowel bij 'nooit' als bij 'liever niet' combineren; kies er één.")
     for (e, d, l) in p.cur:
         if e not in E:
             fouten.append(f"Huidige planning: medewerker '{e}' bestaat niet.")
         elif (d, l) not in p.req:
             fouten.append(f"Huidige planning: afdeling '{d}' op locatie '{l}' staat niet in de vereisten.")
-    for (e, d, groep, l, _u) in p.min_uren:
+    for (d, l), dagen in p.mdo_dag.items():
+        for dag in dagen:
+            if dag not in WERKDAGEN:
+                fouten.append(f"Afdeling {d} ({l}): MDO-dag '{dag}' is geen werkdag (ma, di, wo, do of vr).")
+    for (e, d, groep, l, regel, uren) in p.afspraken:
         if e not in E:
-            fouten.append(f"Minimumuren: medewerker '{e}' bestaat niet.")
-        if (d is None) == (groep is None):
-            fouten.append(f"Minimumuren ({e}): vul precies één van afdeling of afdelingsgroep in.")
+            fouten.append(f"Afspraken: medewerker '{e}' bestaat niet.")
+        if d is not None and groep is not None:
+            fouten.append(f"Afspraken ({e}): vul óf een afdeling óf een afdelingsgroep in, niet allebei.")
+        if d is None and groep is None and l is None:
+            fouten.append(f"Afspraken ({e}): vul een afdeling, een afdelingsgroep of een locatie in.")
         if d is not None and d not in D:
-            fouten.append(f"Minimumuren ({e}): afdeling '{d}' bestaat niet.")
+            fouten.append(f"Afspraken ({e}): afdeling '{d}' bestaat niet.")
         if groep is not None and groep not in groepen:
-            fouten.append(f"Minimumuren ({e}): afdelingsgroep '{groep}' bestaat niet.")
+            fouten.append(f"Afspraken ({e}): afdelingsgroep '{groep}' bestaat niet.")
         if l is not None and l not in L:
-            fouten.append(f"Minimumuren ({e}): locatie '{l}' bestaat niet.")
-    for (d, l), dag in p.mdo_dag.items():
-        if dag not in WERKDAGEN:
-            fouten.append(f"Afdeling {d} ({l}): MDO-dag '{dag}' is geen werkdag (ma, di, wo, do of vr).")
-    for (e, d, l, actie, _u) in p.bijsturing:
-        if e not in E:
-            fouten.append(f"Bijsturing: medewerker '{e}' bestaat niet.")
-        if d not in D:
-            fouten.append(f"Bijsturing ({e}): afdeling '{d}' bestaat niet.")
-        if l is not None and (d, l) not in p.req:
-            fouten.append(f"Bijsturing ({e}): afdeling '{d}' bestaat niet op locatie '{l}'.")
-        if actie not in BIJSTURING_ACTIES:
-            fouten.append(f"Bijsturing ({e}): actie moet 'vastzetten' of 'uitsluiten' zijn.")
+            fouten.append(f"Afspraken ({e}): locatie '{l}' bestaat niet.")
+        elif l is not None and d is not None and (d, l) not in p.req:
+            fouten.append(f"Afspraken ({e}): afdeling '{d}' bestaat niet op locatie '{l}'.")
+        if regel not in REGELS:
+            fouten.append(f"Afspraken ({e}): regel moet {', '.join(REGELS)} zijn.")
+        if regel == "precies" and uren is None:
+            fouten.append(f"Afspraken ({e}): vul bij 'precies' het aantal uren in.")
     return fouten

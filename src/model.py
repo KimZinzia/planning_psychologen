@@ -5,24 +5,27 @@ HiGHS (open-source solver), zie solve.py. Er is dus geen commerciële licentie
 nodig.
 
 Volgt exact de wiskundige formulering: elke functie hieronder komt overeen
-met een sectie daarvan (variabelen, constraint 1..12, objective stap 1..3).
+met een sectie daarvan (variabelen, constraint 1..12, objective doel 1..3).
 
 Er is geen aparte kwalificatie-constraint: de enige reden dat een medewerker
 een afdeling niet mag doen is via de gz_only-regel (constraint 7) — met als
-uitzondering dat MinimumUren een niet-gz medewerker daar wél mag inplannen,
+uitzondering dat een afspraak (minimaal/precies) een niet-gz medewerker daar wél mag inplannen,
 mits er dan ook een gz-psycholoog op diezelfde plek wordt ingepland.
 
 Constraints 8 t/m 12 zijn optioneel en periode-specifiek: ze doen niets
 tenzij je de bijbehorende gegevens invult (zie data.py).
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import pulp
 
-from data import Params
+from data import Params, is_basispsycholoog
 
-MINIMUM_AANWEZIGHEID = 0.5  # "uren" leeg in MinimumUren/bijsturing => op zijn minst dit aantal uur
+# Minimaal aantal uren van een toewijzing (één medewerker op één afdeling op
+# één locatie): wie ergens werkt, werkt daar minstens zoveel uur. Ook gebruikt
+# voor een afspraak 'minimaal' zonder uren ('moet er werken').
+MINIMUM_AANWEZIGHEID = 1.0
 
 # Groepen constraints die je (voor diagnose) los kunt uitzetten. De sleutels
 # worden ook in de app getoond als uitleg waarom een planning niet kan.
@@ -33,9 +36,10 @@ CONSTRAINT_GROEPEN = {
     "gz_only": "Afdelingen 'alleen gz-psycholoog'",
     "max_medewerkers": "Maximum aantal medewerkers per afdeling",
     "afdelingsgroep": "Afdelingsgroep op één locatie",
-    "minimum_uren": "Minimumuren per medewerker",
-    "bijsturing": "Handmatige bijsturing (vastzetten/uitsluiten)",
-    "mdo": "Aanwezig op de MDO-dag van de afdeling",
+    "afspraken": "Afspraken per medewerker (minimaal, precies, uitsluiten)",
+    "minimum_toewijzing": "Minimaal 1 uur per toewijzing",
+    "mdo": "Aanwezig bij de MDO's van de afdeling",
+    "nooit_samen": "Locaties die nooit gecombineerd mogen worden",
 }
 
 
@@ -48,6 +52,17 @@ class Variabelen:
     w: dict  # w[e] binair
     dl_pairs: list[tuple[str, str]]
     ub: dict  # ub[e,d,l]: bovengrens op x[e,d,l], zie _bovengrens_uren
+    # mdo_zonder_gz[d,l] binair: 1 = bij deze afdeling (met meerdere MDO-dagen)
+    # is geen gz-psycholoog die bij álle MDO's kan zijn. Gevuld door add_mdo_constraints.
+    mdo_zonder_gz: dict = field(default_factory=dict)
+    mdo_gz_geschikt: dict = field(default_factory=dict)
+    # werkt[e,d,l] binair, alleen voor afdelingen op meerdere locaties (zie add_minimum_toewijzing_constraints)
+    werkt: dict = field(default_factory=dict)
+    # boven_max[e] >= 0: uren dat basispsycholoog e boven de maximale bezetting zit (zie add_basis_constraints)
+    boven_max: dict = field(default_factory=dict)
+    # tekort[d,l] >= 0: uren die afdeling d op locatie l tekortkomt (zie add_coverage_constraints)
+    tekort: dict = field(default_factory=dict)
+    tekort_half: dict = field(default_factory=dict)  # alleen bij een tekort: tekort = 0,5 * tekort_half (zie solve._dek_zorg)  # [d,l] -> gz-psychologen die op alle MDO-dagen werken
 
 
 def get_dl_pairs(p: Params) -> list[tuple[str, str]]:
@@ -86,10 +101,8 @@ def _bovengrens_uren(p: Params, dl_pairs) -> dict[tuple[str, str, str], float]:
     hoe kleiner big-M, hoe beter de LP-relaxatie en hoe sneller het oplossen.
     """
     verplicht: dict[str, float] = {}
-    for (e, _d, _groep, _l, uren) in p.min_uren:
-        verplicht[e] = max(verplicht.get(e, 0), uren if uren is not None else MINIMUM_AANWEZIGHEID)
-    for (e, _d, _l, actie, uren) in p.bijsturing:
-        if actie == "vastzetten":
+    for (e, _d, _groep, _l, regel, uren) in p.afspraken:
+        if regel in ("minimaal", "precies"):
             verplicht[e] = max(verplicht.get(e, 0), uren if uren is not None else MINIMUM_AANWEZIGHEID)
 
     return {
@@ -135,9 +148,17 @@ def build_variables(model: pulp.LpProblem, p: Params) -> Variabelen:
 
 
 def add_coverage_constraints(model, p: Params, v: Variabelen):
-    """Constraint 1: vraagdekking. sum_e x[e,d,l] >= req[d,l] voor elke (d,l)."""
-    for (d, l) in v.dl_pairs:
-        model += pulp.lpSum(v.x[e, d, l] for e in p.E) >= p.req[d, l]
+    """Constraint 1: vraagdekking. sum_e x[e,d,l] + tekort[d,l] >= req[d,l].
+
+    tekort[d,l] >= 0 is het aantal uren dat afdeling d op locatie l tekortkomt.
+    Normaal is dat 0; solve.py maakt het tekort als allereerste zo klein
+    mogelijk. Zo is er bij te weinig formatie tóch een rooster, waarin het
+    tekort zo klein en eerlijk mogelijk verdeeld is (zie solve.py).
+    """
+    for i, (d, l) in enumerate(v.dl_pairs):
+        tekort = model.add_variable(f"tekort_{i}", lowBound=0, upBound=p.req[d, l])
+        v.tekort[d, l] = tekort
+        model += pulp.lpSum(v.x[e, d, l] for e in p.E) + tekort >= p.req[d, l]
 
 
 def add_availability_constraints(model, p: Params, v: Variabelen):
@@ -173,6 +194,21 @@ def add_z_linking_constraints(model, p: Params, v: Variabelen):
                 model += cur_val - v.x[e, d, l] <= cur_val * v.z[e, d, l]
 
 
+def add_versterkingen(model, p: Params, v: Variabelen):
+    """Geen extra eis, maar een versterking zodat de solver sneller rekent.
+
+    Werkt e nu al uren op (d,l) en blijft dat ongewijzigd (z = 0), dan werkt
+    e daar dus nog steeds: y[e,d] >= 1 - z[e,d,l] en y_loc[e,l] >= 1 - z[e,d,l].
+    Elke geldige planning voldoet hier al aan, maar zonder deze regels 'ziet'
+    de solver dat pas laat. Halveert de rekentijd van stap 1 en zorgt dat
+    stap 2 bewezen optimaal wordt (gemeten op de echte invoer).
+    """
+    for (e, d, l), cur in p.cur.items():
+        if cur > 0 and (e, d, l) in v.x:
+            model += v.y[e, d] >= 1 - v.z[e, d, l]
+            model += v.y_loc[e, l] >= 1 - v.z[e, d, l]
+
+
 def add_yloc_linking_constraints(model, p: Params, v: Variabelen):
     """Constraint 5a: koppelt y_loc[e,l] in beide richtingen aan x.
 
@@ -194,6 +230,41 @@ def add_yloc_linking_constraints(model, p: Params, v: Variabelen):
             model += pulp.lpSum(v.x[e, d, l] for d in departments) >= MINIMUM_AANWEZIGHEID * v.y_loc[e, l]
 
 
+def add_minimum_toewijzing_constraints(model, p: Params, v: Variabelen):
+    """Wie op een afdeling werkt, werkt daar minstens MINIMUM_AANWEZIGHEID uur:
+    x[e,d,l] = 0 of x[e,d,l] >= MINIMUM_AANWEZIGHEID.
+
+    Voor een afdeling op één locatie is y[e,d] precies 'werkt e hier', dus
+    x >= minimum * y. Een afdeling op meerdere locaties (bv. AGT) krijgt per
+    locatie een eigen ja/nee-variabele.
+    """
+    locaties = _locations_per_department(v.dl_pairs)
+    ie = {e: i for i, e in enumerate(p.E)}
+    idl = {dl: i for i, dl in enumerate(v.dl_pairs)}
+    for e in p.E:
+        for (d, l) in v.dl_pairs:
+            if len(locaties[d]) == 1:
+                model += v.x[e, d, l] >= MINIMUM_AANWEZIGHEID * v.y[e, d]
+            else:
+                werkt = model.add_variable(f"werkt_{ie[e]}_{idl[d, l]}", cat="Binary")
+                v.werkt[e, d, l] = werkt
+                model += v.x[e, d, l] <= v.ub[e, d, l] * werkt
+                model += v.x[e, d, l] >= MINIMUM_AANWEZIGHEID * werkt
+
+
+def add_basis_constraints(model, p: Params, v: Variabelen):
+    """Basispsychologen (geen gz, niet in opleiding) liefst niet voller dan
+    max_bezetting_basis van hun inzetbare uren. Geen harde eis: boven_max[e]
+    meet hoeveel uur e erboven zit, en solve.py maakt dat zo klein mogelijk.
+    """
+    ie = {e: i for i, e in enumerate(p.E)}
+    for e in p.E:
+        if p.avail[e] > 0 and is_basispsycholoog(p, e):
+            boven = model.add_variable(f"boven_max_{ie[e]}", lowBound=0)
+            v.boven_max[e] = boven
+            model += pulp.lpSum(v.x[e, d, l] for (d, l) in v.dl_pairs) - p.max_bezetting_basis * p.avail[e] <= boven
+
+
 def add_w_linking_constraints(model, p: Params, v: Variabelen):
     """Constraint 5b: w[e] = 1 als e zowel op p.l1 als p.l2 werkt."""
     for e in p.E:
@@ -209,12 +280,15 @@ def add_gz_psycholoog_constraints(model, p: Params, v: Variabelen):
 
 
 def _min_uren_target_dl(p: Params, dl_pairs, d, groep, l):
-    """Vertaalt één MinimumUren-rij (afdeling of afdelingsgroep, optioneel
-    locatie) naar de (afdeling, locatie)-paren waar hij op slaat."""
+    """Vertaalt één afspraak (afdeling, afdelingsgroep of geen van beide,
+    optioneel locatie) naar de (afdeling, locatie)-paren waar hij op slaat.
+    Geen afdeling en geen groep = alle afdelingen (op locatie l)."""
     if d is not None:
         target = [(dep, loc) for (dep, loc) in dl_pairs if dep == d]
-    else:
+    elif groep is not None:
         target = [(dep, loc) for (dep, loc) in dl_pairs if p.afdelingsgroep.get(dep) == groep]
+    else:
+        target = list(dl_pairs)
     if l is not None:
         target = [(dep, loc) for (dep, loc) in target if loc == l]
     return target
@@ -222,17 +296,15 @@ def _min_uren_target_dl(p: Params, dl_pairs, d, groep, l):
 
 def add_gz_only_constraints(model, p: Params, v: Variabelen):
     """Constraint 7: als (d,l) gemarkeerd is als 'alleen gz-psycholoog', mag
-    niemand zonder gz_e=1 daar uren maken — tenzij MinimumUren (of een
-    handmatige vastzetting) die medewerker daar juist verplicht stelt. In dat
-    geval mag het wel, maar dan moet er op diezelfde (afdeling, locatie) ook
-    een gz-psycholoog worden ingepland (met z'n tweeën)."""
+    niemand zonder gz_e=1 daar uren maken — tenzij een afspraak (minimaal of
+    precies) die medewerker daar juist verplicht stelt. In dat geval mag het
+    wel, maar dan moet er op diezelfde (afdeling, locatie) ook een
+    gz-psycholoog worden ingepland (met z'n tweeën). Een afspraak voor een hele
+    locatie geeft deze uitzondering niet: die noemt geen specifieke afdeling."""
     exempted: set[tuple[str, str, str]] = set()
-    for (e, d, groep, l, _uren) in p.min_uren:
-        for (dep, loc) in _min_uren_target_dl(p, v.dl_pairs, d, groep, l):
-            exempted.add((e, dep, loc))
-    for (e, d, l, actie, _uren) in p.bijsturing:
-        if actie == "vastzetten":
-            for (dep, loc) in _min_uren_target_dl(p, v.dl_pairs, d, None, l):
+    for (e, d, groep, l, regel, _uren) in p.afspraken:
+        if regel in ("minimaal", "precies") and (d is not None or groep is not None):
+            for (dep, loc) in _min_uren_target_dl(p, v.dl_pairs, d, groep, l):
                 exempted.add((e, dep, loc))
 
     needs_buddy: set[tuple[str, str]] = set()
@@ -288,53 +360,79 @@ def add_afdelingsgroep_constraints(model, p: Params, v: Variabelen):
             model += pulp.lpSum(y_group[e, l] for l in locations) <= 1
 
 
-def add_minimum_uren_constraints(model, p: Params, v: Variabelen):
-    """Constraint 10 (optioneel): verplicht minimumaantal uren voor een
-    medewerker op een afdeling óf een afdelingsgroep, desgewenst toegespitst
-    op een locatie. Uren leeg => moet er zijn, aantal maakt niet uit; dat
-    wordt hier vertaald naar MINIMUM_AANWEZIGHEID uur."""
-    for (e, d, groep, l, uren) in p.min_uren:
-        target_dl = _min_uren_target_dl(p, v.dl_pairs, d, groep, l)
-        minimum = uren if uren is not None else MINIMUM_AANWEZIGHEID
-        model += pulp.lpSum(v.x[e, dep, loc] for (dep, loc) in target_dl) >= minimum
-
-
-def add_bijsturing_constraints(model, p: Params, v: Variabelen):
-    """Constraint 11 (optioneel): handmatige bijsturing vanuit de app.
-    - 'uitsluiten': medewerker e mag niet op afdeling d werken (op locatie l,
-      of op alle locaties als l leeg is).
-    - 'vastzetten': medewerker e moet daar precies 'uren' uur werken; uren
-      leeg => moet er zijn, aantal maakt niet uit (>= MINIMUM_AANWEZIGHEID).
+def add_afspraken_constraints(model, p: Params, v: Variabelen):
+    """Constraint 10 (optioneel): afspraken per medewerker, voor een afdeling,
+    een afdelingsgroep of een hele locatie (eventueel toegespitst op een locatie).
+    - 'minimaal':   minstens 'uren' uur; uren leeg => moet er werken, aantal
+                    maakt niet uit (>= MINIMUM_AANWEZIGHEID);
+    - 'precies':    precies 'uren' uur;
+    - 'uitsluiten': daar geen uren.
     """
-    for (e, d, l, actie, uren) in p.bijsturing:
-        target_dl = _min_uren_target_dl(p, v.dl_pairs, d, None, l)
+    for (e, d, groep, l, regel, uren) in p.afspraken:
+        target_dl = _min_uren_target_dl(p, v.dl_pairs, d, groep, l)
         totaal = pulp.lpSum(v.x[e, dep, loc] for (dep, loc) in target_dl)
-        if actie == "uitsluiten":
+        if regel == "minimaal":
+            model += totaal >= (uren if uren is not None else MINIMUM_AANWEZIGHEID)
+        elif regel == "precies":
+            model += totaal == uren
+        elif regel == "uitsluiten":
             model += totaal == 0
-        elif actie == "vastzetten":
-            if uren is None:
-                model += totaal >= MINIMUM_AANWEZIGHEID
-            else:
-                model += totaal == uren
         else:
-            raise ValueError(f"Onbekende bijsturing-actie: {actie!r}")
+            raise ValueError(f"Onbekende regel in afspraken: {regel!r}")
 
 
 def add_mdo_constraints(model, p: Params, v: Variabelen):
-    """Constraint 12 (optioneel): wie op een afdeling werkt, moet werken op de
-    dag van het MDO van die afdeling. Een medewerker die op die dag niet werkt,
-    kan daar dus niet ingepland worden: x[e,d,l] = 0.
+    """Constraint 11 (optioneel): MDO's. Per afdeling met MDO-dag(en):
+
+    a. Wie op de afdeling werkt, werkt op minstens één van de MDO-dagen.
+       Bij één MDO-dag betekent dat: op die dag. Wie op geen van de dagen
+       werkt, kan er dus niet ingepland worden: x[e,d,l] = 0.
+    b. Bij meerdere MDO-dagen: op élke MDO-dag werkt minstens één
+       psycholoog van die afdeling (met uren daar). Werkt er maar één, dan
+       moet die dus op alle MDO-dagen werken.
+    c. Voorkeur (geen eis): liefst een gz-psycholoog die bij álle MDO's van
+       de afdeling kan zijn. mdo_zonder_gz[d,l] = 1 als dat niet lukt; het
+       aantal daarvan wordt in solve.py zo klein mogelijk gemaakt.
 
     Medewerkers zonder ingevulde werkdagen gelden als 'onbekend' en worden
-    niet beperkt. Afdelingen zonder MDO-dag ook niet.
+    niet beperkt (ze tellen overal als aanwezig). Afdelingen zonder MDO-dag
+    ook niet.
     """
-    for (d, l), dag in p.mdo_dag.items():
-        if (d, l) not in v.dl_pairs:
-            continue
-        for e in p.E:
-            dagen = p.werkdagen.get(e, set())
-            if dagen and dag not in dagen:
+    for (d, l), mdo in p.mdo_dag.items():
+        if (d, l) not in v.dl_pairs or p.req[d, l] <= 0:
+            continue  # bv. tijdelijk 0 uur (noodplanning): dan ook geen MDO-eisen
+        mdo = set(mdo)
+
+        def aanwezig(e, dagen):
+            werk = p.werkdagen.get(e, set())
+            return not werk or dagen <= werk
+
+        for e in p.E:  # a
+            werk = p.werkdagen.get(e, set())
+            if werk and not (mdo & werk):
                 model += v.x[e, d, l] == 0
+        if len(mdo) < 2:
+            continue
+        for dag in mdo:  # b
+            model += pulp.lpSum(v.x[e, d, l] for e in p.E if aanwezig(e, {dag})) >= MINIMUM_AANWEZIGHEID
+        # c: gz-psycholoog die op alle MDO-dagen werkt
+        geschikt = [e for e in p.E if p.gz.get(e, 0) == 1 and aanwezig(e, mdo)]
+        straf = model.add_variable(f"mdo_zonder_gz_{len(v.mdo_zonder_gz)}", cat="Binary")
+        v.mdo_zonder_gz[d, l] = straf
+        v.mdo_gz_geschikt[d, l] = geschikt
+        model += pulp.lpSum(v.x[e, d, l] for e in geschikt) >= MINIMUM_AANWEZIGHEID * (1 - straf)
+
+
+def add_nooit_samen_constraints(model, p: Params, v: Variabelen):
+    """Constraint 12 (optioneel): locatieparen die één medewerker nooit mag
+    combineren (bv. ONO en RK): y_loc[e,a] + y_loc[e,b] <= 1.
+
+    Dit is een harde eis, anders dan het reispaar l1/l2 (doel 1 van de
+    doelfunctie), dat alleen 'liever niet' is."""
+    for a, b in p.nooit_samen:
+        if a in p.L and b in p.L and a != b:
+            for e in p.E:
+                model += v.y_loc[e, a] + v.y_loc[e, b] <= 1
 
 
 def build_model(p: Params, uitzetten: frozenset[str] = frozenset()) -> tuple[pulp.LpProblem, Variabelen]:
@@ -361,13 +459,18 @@ def build_model(p: Params, uitzetten: frozenset[str] = frozenset()) -> tuple[pul
         (None, add_z_linking_constraints),
         (None, add_yloc_linking_constraints),
         (None, add_w_linking_constraints),
+        ("minimum_toewijzing", add_minimum_toewijzing_constraints),
+        (None, add_basis_constraints),
         ("gz_per_locatie", add_gz_psycholoog_constraints),
         ("gz_only", add_gz_only_constraints),
         ("max_medewerkers", add_max_medewerkers_constraints),
         ("afdelingsgroep", add_afdelingsgroep_constraints),
-        ("minimum_uren", add_minimum_uren_constraints),
-        ("bijsturing", add_bijsturing_constraints),
+        ("afspraken", add_afspraken_constraints),
         ("mdo", add_mdo_constraints),
+        ("nooit_samen", add_nooit_samen_constraints),
+        # Bewust als laatste: HiGHS is gevoelig voor de volgorde van regels en
+        # rekent op deze manier het snelst (gemeten op de echte invoer).
+        (None, add_versterkingen),
     ]
     for groep, functie in stappen:
         if groep not in uitzetten:
