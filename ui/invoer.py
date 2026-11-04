@@ -26,6 +26,7 @@ from data import (
     bereken_inzetbare_tijd,
     bereken_uren_opbouw,
     is_basispsycholoog,
+    is_piog,
     load_excel_tables,
     WEKEN,
     lees_tijd,
@@ -253,7 +254,7 @@ def _tab_afdelingen(tabellen) -> None:
             st.markdown(
                 "- **Alleen gz**: alleen gz-psychologen mogen hier werken.\n"
                 "- **Max. medewerkers**: hoeveel verschillende medewerkers er maximaal op deze afdeling mogen (leeg = geen maximum).\n"
-                "- **Afdelingsgroep**: afdelingen met hetzelfde label (bv. *GRZ*) doet een medewerker op één locatie.\n"
+                "- **Afdelingsgroep**: label (bv. *GRZ*) om afdelingen te groeperen, zodat een afspraak voor de hele groep kan gelden.\n"
                 "- **Voorrang bij tekort**: is er te weinig formatie, dan wordt deze afdeling zo min mogelijk gekort.\n\n"
                 + UITLEG_RIJEN
             )
@@ -472,14 +473,17 @@ def _tab_extra_eisen(tabellen) -> None:
 def _werkdruk_basis(tabellen) -> None:
     p = params_from_tables(tabellen)
     basis = [e for e in p.E if p.avail[e] > 0 and is_basispsycholoog(p, e)]
+    piog = [e for e in p.E if p.avail[e] > 0 and is_piog(p, e)]
     with st.container(border=True):
         st.subheader("Werkdruk")
         st.caption(
             "Hoe vol medewerkers liefst worden ingepland, als percentage van hun inzetbare uren. Dit zijn voorkeuren, "
             "geen harde grenzen: als het niet anders kan, wijkt de planning ervan af, zo weinig mogelijk. "
-            "Het maximum voor basispsychologen en het maximum aantal afdelingen wegen het zwaarst: "
+            "Het maximum voor masterpsychologen en het maximum aantal afdelingen wegen het zwaarst: "
             "die gaan vóór de andere doelen. "
-            f"Basispsycholoog = geen gz en niet in opleiding (nu: {', '.join(basis) if basis else 'niemand'})."
+            f"Masterpsycholoog = geen gz en niet in opleiding (nu: {', '.join(basis) if basis else 'niemand'}). "
+            f"PIOG = in opleiding (nu: {', '.join(piog) if piog else 'niemand'}); hun inzetbare uren zijn al "
+            f"gecorrigeerd voor de {PIOG_PRODUCTIVITEIT:.0%} productiviteit."
         )
         with st.form("werkdruk_basis", border=False):
             c1, c2, c3, c4 = st.columns(4)
@@ -488,28 +492,33 @@ def _werkdruk_basis(tabellen) -> None:
                 value=int(round(p.streef_bezetting_gz * 100)),
             )
             minimaal = c2.number_input(
-                "Niet-gz: liefst minimaal (%)", min_value=0, max_value=100, step=5,
+                "Masterpsychologen: liefst minimaal (%)", min_value=0, max_value=100, step=5,
                 value=int(round(p.min_bezetting_niet_gz * 100)),
             )
             maximaal = c3.number_input(
-                "Niet-gz: liefst maximaal (%)", min_value=0, max_value=100, step=5,
+                "Masterpsychologen: liefst maximaal (%)", min_value=0, max_value=100, step=5,
                 value=int(round(p.max_bezetting_niet_gz * 100)),
             )
             pct = c4.number_input(
-                "Basispsychologen: maximaal (%)", min_value=50, max_value=100, step=5,
+                "Masterpsychologen: maximaal, weegt zwaar (%)", min_value=50, max_value=100, step=5,
                 value=int(round(p.max_bezetting_basis * 100)),
             )
-            c5, _r1, _r2, _r3 = st.columns(4)
-            max_afd = c5.number_input(
+            c5, c6, _r2, _r3 = st.columns(4)
+            streef_piog = c5.number_input(
+                "PIOG: streven naar (%)", min_value=50, max_value=100, step=5,
+                value=int(round(p.streef_bezetting_piog * 100)),
+            )
+            max_afd = c6.number_input(
                 "Liefst maximaal … afdelingen per medewerker", min_value=0, max_value=20, step=1,
                 value=int(p.max_afdelingen), help="0 = geen maximum.",
             )
             if st.form_submit_button("Opslaan", type="primary", disabled=achtergrond.bezig()):
                 if minimaal > maximaal:
-                    st.error("Bij niet-gz moet het minimum lager zijn dan het maximum.")
+                    st.error("Bij masterpsychologen moet het minimum lager zijn dan het maximum.")
                     st.stop()
                 config = tabellen["Config"].set_index("key")["value"].to_dict()
                 nieuw = {**config, "max_bezetting_basis": str(int(pct)), "streef_bezetting_gz": str(int(gz)),
+                         "streef_bezetting_piog": str(int(streef_piog)),
                          "min_bezetting_niet_gz": str(int(minimaal)), "max_bezetting_niet_gz": str(int(maximaal)),
                          "max_afdelingen": str(int(max_afd))}
                 # Alleen de instellingen wegschrijven; de rest van de invoer blijft onaangeroerd.
@@ -647,7 +656,7 @@ def _afspraken(tabellen) -> None:
 def _reizen_beperken(tabellen) -> None:
     L = namen(tabellen)[2]
     with st.container(border=True):
-        st.subheader("Reizen beperken")
+        st.subheader("Locaties combineren")
         config = tabellen["Config"].set_index("key")["value"].to_dict()
         idx = lambda w, standaard: L.index(w) if w in L else standaard  # noqa: E731
         GEEN = "(geen)"
@@ -663,17 +672,28 @@ def _reizen_beperken(tabellen) -> None:
             c1, c2, _ruimte = st.columns([1, 1, 2])
             l1 = c1.selectbox("Locatie", L, index=idx(config.get("locatie_1"), 0), key="liever_1")
             l2 = c2.selectbox("Locatie", L, index=idx(config.get("locatie_2"), min(1, len(L) - 1)), key="liever_2")
+            st.markdown("**Altijd samen**")
+            st.caption("Harde regel: wie op de eerste locatie werkt, werkt ook op de tweede (bv. Rijnhof alleen samen met ONO).")
+            c1, c2, _ruimte = st.columns([1, 1, 2])
+            s1 = c1.selectbox("Wie werkt op", met_geen, index=met_geen.index(config.get("samen_1")) if config.get("samen_1") in L else 0, key="samen_1")
+            s2 = c2.selectbox("werkt ook op", met_geen, index=met_geen.index(config.get("samen_2")) if config.get("samen_2") in L else 0, key="samen_2")
             if st.form_submit_button("Opslaan", type="primary", disabled=achtergrond.bezig()):
                 nooit_leeg = n1 == GEEN and n2 == GEEN
+                samen_leeg = s1 == GEEN and s2 == GEEN
                 if l1 == l2:
                     st.error("Kies bij 'liever niet combineren' twee verschillende locaties.")
                 elif not nooit_leeg and (GEEN in (n1, n2) or n1 == n2):
                     st.error("Kies bij 'nooit combineren' twee verschillende locaties, of twee keer '(geen)'.")
                 elif {n1, n2} == {l1, l2}:
                     st.error("Hetzelfde paar staat bij 'nooit' én bij 'liever niet'; kies er één.")
+                elif not samen_leeg and (GEEN in (s1, s2) or s1 == s2):
+                    st.error("Kies bij 'altijd samen' twee verschillende locaties, of twee keer '(geen)'.")
+                elif not samen_leeg and not nooit_leeg and {s1, s2} == {n1, n2}:
+                    st.error("Hetzelfde paar staat bij 'nooit' én bij 'altijd samen'; kies er één.")
                 else:
                     nieuw = {**config, "locatie_1": l1, "locatie_2": l2,
-                             "nooit_1": None if nooit_leeg else n1, "nooit_2": None if nooit_leeg else n2}
+                             "nooit_1": None if nooit_leeg else n1, "nooit_2": None if nooit_leeg else n2,
+                             "samen_1": None if samen_leeg else s1, "samen_2": None if samen_leeg else s2}
                     # Alleen de instellingen wegschrijven; de rest van de invoer blijft onaangeroerd.
                     store.schrijf_tabel("Config", pd.DataFrame({"key": list(nieuw), "value": list(nieuw.values())}))
                     st.session_state["meldingen"] = ["Opgeslagen"]

@@ -46,6 +46,7 @@ def signalen(tabellen: dict[str, pd.DataFrame]) -> list[Signaal]:
     result += _huidige_planning(p)
     result += _werkdagen(p)
     result += _nooit_samen(p)
+    result += _altijd_samen(p)
     volgorde = {"fout": 0, "waarschuwing": 1, "info": 2}
     return sorted(result, key=lambda s: volgorde[s.niveau])
 
@@ -199,6 +200,37 @@ def _werkdagen(p: Params) -> list[Signaal]:
             zonder,
         )]
     return []
+
+
+def _altijd_samen(p: Params) -> list[Signaal]:
+    """Wie nu op locatie a werkt zonder b, krijgt sowieso een ander rooster.
+    En wie op a moet werken maar van b is uitgesloten, kan niet worden ingepland."""
+    result: list[Signaal] = []
+    for a, b in p.altijd_samen:
+        locs: dict[str, set[str]] = {}
+        for (e, _d, l), uren in p.cur.items():
+            if uren > 0:
+                locs.setdefault(e, set()).add(l)
+        nu = sorted(e for e, s in locs.items() if a in s and b not in s)
+        if nu:
+            result.append(Signaal(
+                "info",
+                f"{len(nu)} medewerker(s) werken nu op {a} maar niet op {b}. Wie op {a} werkt, moet ook op {b} "
+                "werken, dus hun rooster verandert; dat telt mee als wijziging.",
+                nu,
+            ))
+        moet_a = {e for (e, _d, _g, l, regel, _u) in p.afspraken if regel in ("minimaal", "precies") and l == a}
+        niet_b = {e for (e, d, g, l, regel, _u) in p.afspraken
+                  if regel == "uitsluiten" and l == b and d is None and g is None}
+        botsing = sorted(moet_a & niet_b)
+        if botsing:
+            result.append(Signaal(
+                "fout",
+                f"Een afspraak (Extra eisen) zet iemand op {a} en sluit die persoon uit van {b}, terwijl wie op {a} "
+                f"werkt ook op {b} moet werken.",
+                botsing,
+            ))
+    return result
 
 
 def _nooit_samen(p: Params) -> list[Signaal]:

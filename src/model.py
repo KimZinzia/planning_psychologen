@@ -35,11 +35,11 @@ CONSTRAINT_GROEPEN = {
     "gz_per_locatie": "Minimaal 1 gz-psycholoog per locatie",
     "gz_only": "Afdelingen 'alleen gz-psycholoog'",
     "max_medewerkers": "Maximum aantal medewerkers per afdeling",
-    "afdelingsgroep": "Afdelingsgroep op één locatie",
     "afspraken": "Afspraken per medewerker (minimaal, precies, uitsluiten)",
     "minimum_toewijzing": "Minimaal 1 uur per toewijzing",
     "mdo": "Aanwezig bij de IDO's van de afdeling (niet twee tegelijk)",
     "nooit_samen": "Locaties die nooit gecombineerd mogen worden",
+    "altijd_samen": "Locaties die altijd samen gaan (wie op de ene werkt, werkt ook op de andere)",
 }
 
 
@@ -62,7 +62,7 @@ class Variabelen:
     ido_gz_alle: dict = field(default_factory=dict)
     # werkt[e,d,l] binair, alleen voor afdelingen op meerdere locaties (zie add_minimum_toewijzing_constraints)
     werkt: dict = field(default_factory=dict)
-    # boven_max[e] >= 0: uren dat basispsycholoog e boven de maximale bezetting zit (zie add_basis_constraints)
+    # boven_max[e] >= 0: uren dat masterpsycholoog e boven de maximale bezetting zit (zie add_basis_constraints)
     boven_max: dict = field(default_factory=dict)
     # tekort[d,l] >= 0: uren die afdeling d op locatie l tekortkomt (zie add_coverage_constraints)
     tekort: dict = field(default_factory=dict)
@@ -259,7 +259,7 @@ def add_minimum_toewijzing_constraints(model, p: Params, v: Variabelen):
 
 
 def add_basis_constraints(model, p: Params, v: Variabelen):
-    """Basispsychologen (geen gz, niet in opleiding) liefst niet voller dan
+    """Masterpsychologen (geen gz, niet in opleiding) liefst niet voller dan
     max_bezetting_basis van hun inzetbare uren. Geen harde eis: boven_max[e]
     meet hoeveel uur e erboven zit, en solve.py maakt dat zo klein mogelijk.
     """
@@ -336,38 +336,8 @@ def add_max_medewerkers_constraints(model, p: Params, v: Variabelen):
         model += pulp.lpSum(v.y[e, d] for e in p.E) <= cap
 
 
-def add_afdelingsgroep_constraints(model, p: Params, v: Variabelen):
-    """Constraint 9 (optioneel): afdelingen met hetzelfde afdelingsgroep-label
-    (bv. "GRZ") horen bij elkaar — een medewerker die in die groep werkt,
-    moet dat op precies één locatie doen. Doet niets voor afdelingen zonder
-    afdelingsgroep, of groepen die toch al maar op 1 locatie voorkomen."""
-    groepen: dict[str, list[tuple[str, str]]] = {}
-    for (d, l) in v.dl_pairs:
-        groep = p.afdelingsgroep.get(d)
-        if groep is not None:
-            groepen.setdefault(groep, []).append((d, l))
-
-    ie = {e: i for i, e in enumerate(p.E)}
-    for gi, (groep, group_dl_pairs) in enumerate(sorted(groepen.items())):
-        locations = sorted({l for (_d, l) in group_dl_pairs})
-        if len(locations) < 2:
-            continue
-        departments_per_location = _departments_per_location(group_dl_pairs)
-
-        y_group = {
-            (e, l): model.add_variable(f"ygroup_{gi}_{ie[e]}_{li}", cat="Binary")
-            for e in p.E
-            for li, l in enumerate(locations)
-        }
-        for e in p.E:
-            for l in locations:
-                for d in departments_per_location[l]:
-                    model += v.x[e, d, l] <= v.ub[e, d, l] * y_group[e, l]
-            model += pulp.lpSum(y_group[e, l] for l in locations) <= 1
-
-
 def add_afspraken_constraints(model, p: Params, v: Variabelen):
-    """Constraint 10 (optioneel): afspraken per medewerker, voor een afdeling,
+    """Constraint 9 (optioneel): afspraken per medewerker, voor een afdeling,
     een afdelingsgroep of een hele locatie (eventueel toegespitst op een locatie).
     - 'minimaal':   minstens 'uren' uur; uren leeg => moet er werken, aantal
                     maakt niet uit (>= MINIMUM_AANWEZIGHEID);
@@ -484,6 +454,16 @@ def add_nooit_samen_constraints(model, p: Params, v: Variabelen):
                 model += v.y_loc[e, a] + v.y_loc[e, b] <= 1
 
 
+def add_altijd_samen_constraints(model, p: Params, v: Variabelen):
+    """Wie op locatie a werkt, werkt ook op locatie b (bv. Rijnhof alleen in
+    combinatie met ONO): y_loc[e,a] <= y_loc[e,b]. Omdat y_loc in beide
+    richtingen aan de uren gekoppeld is, betekent dat echt uren op b."""
+    for a, b in p.altijd_samen:
+        if a in p.L and b in p.L and a != b:
+            for e in p.E:
+                model += v.y_loc[e, a] <= v.y_loc[e, b]
+
+
 def build_model(p: Params, uitzetten: frozenset[str] = frozenset()) -> tuple[pulp.LpProblem, Variabelen]:
     """Bouwt het volledige model (constraints 1 t/m 11, in volgorde van de formulering).
 
@@ -513,10 +493,10 @@ def build_model(p: Params, uitzetten: frozenset[str] = frozenset()) -> tuple[pul
         ("gz_per_locatie", add_gz_psycholoog_constraints),
         ("gz_only", add_gz_only_constraints),
         ("max_medewerkers", add_max_medewerkers_constraints),
-        ("afdelingsgroep", add_afdelingsgroep_constraints),
         ("afspraken", add_afspraken_constraints),
         ("mdo", add_mdo_constraints),
         ("nooit_samen", add_nooit_samen_constraints),
+        ("altijd_samen", add_altijd_samen_constraints),
         # Bewust als laatste: HiGHS is gevoelig voor de volgorde van regels en
         # rekent op deze manier het snelst (gemeten op de echte invoer).
         (None, add_versterkingen),

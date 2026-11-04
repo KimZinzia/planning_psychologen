@@ -16,6 +16,7 @@ from data import (
     MIN_BEZETTING_NIET_GZ,
     PIOG_PRODUCTIVITEIT,
     STREEF_BEZETTING_GZ,
+    STREEF_BEZETTING_PIOG,
     params_from_tables,
 )
 from model import MINIMUM_AANWEZIGHEID
@@ -25,16 +26,18 @@ from ui.stijl import paginakop
 from ui.planning import UITGEZONDERD_HEADCOUNT
 
 
-def _reisregels() -> tuple[str, str]:
-    """(liever niet, nooit) als tekst, uit de huidige invoer."""
-    liever, nooit = "twee ingestelde locaties", "geen"
+def _reisregels() -> tuple[str, str, str]:
+    """(liever niet, nooit, altijd samen) als tekst, uit de huidige invoer."""
+    liever, nooit, samen = "twee ingestelde locaties", "geen", "geen"
     if store.heeft_gegevens():
         p = params_from_tables(store.lees_tabellen())
         if p.l1 and p.l2:
             liever = f"{p.l1} en {p.l2}"
         if p.nooit_samen:
             nooit = ", ".join(f"{a} en {b}" for a, b in p.nooit_samen)
-    return liever, nooit
+        if p.altijd_samen:
+            samen = ", ".join(f"wie op {a} werkt, werkt ook op {b}" for a, b in p.altijd_samen)
+    return liever, nooit, samen
 
 
 def _max_basis() -> int:
@@ -43,11 +46,14 @@ def _max_basis() -> int:
     return round(MAX_BEZETTING_BASIS * 100)
 
 
-def _werkdruk() -> tuple[int, int, int]:
+def _werkdruk() -> tuple[int, int, int, int]:
+    """(gz, PIOG, master minimaal, master maximaal) in procenten."""
     if store.heeft_gegevens():
         p = params_from_tables(store.lees_tabellen())
-        return round(p.streef_bezetting_gz * 100), round(p.min_bezetting_niet_gz * 100), round(p.max_bezetting_niet_gz * 100)
-    return round(STREEF_BEZETTING_GZ * 100), round(MIN_BEZETTING_NIET_GZ * 100), round(MAX_BEZETTING_NIET_GZ * 100)
+        return (round(p.streef_bezetting_gz * 100), round(p.streef_bezetting_piog * 100),
+                round(p.min_bezetting_niet_gz * 100), round(p.max_bezetting_niet_gz * 100))
+    return (round(STREEF_BEZETTING_GZ * 100), round(STREEF_BEZETTING_PIOG * 100),
+            round(MIN_BEZETTING_NIET_GZ * 100), round(MAX_BEZETTING_NIET_GZ * 100))
 
 
 def _kaart(nummer: int, titel: str, tekst: str, voorbeeld: str) -> None:
@@ -58,10 +64,10 @@ def _kaart(nummer: int, titel: str, tekst: str, voorbeeld: str) -> None:
 
 
 def pagina_toelichting() -> None:
-    liever, nooit = _reisregels()
+    liever, nooit, samen = _reisregels()
     max_basis = _max_basis()
     max_afd = params_from_tables(store.lees_tabellen()).max_afdelingen if store.heeft_gegevens() else MAX_AFDELINGEN
-    streef_gz, min_niet_gz, max_niet_gz = _werkdruk()
+    streef_gz, streef_piog, min_niet_gz, max_niet_gz = _werkdruk()
     piog = round(PIOG_PRODUCTIVITEIT * 100)
     minuten = TIJDSLIMIET_PER_STAP // 60
 
@@ -101,7 +107,7 @@ def pagina_toelichting() -> None:
     with vooraf_rechts.container(border=True, key="kaart_toel_basis"):
         st.markdown("#### Daarna: werkdruk")
         st.markdown(
-            f"Een basispsycholoog (geen gz, niet in opleiding) wordt liefst niet voller ingepland dan {max_basis}% van "
+            f"Een masterpsycholoog (geen gz, niet in opleiding) wordt liefst niet voller ingepland dan {max_basis}% van "
             "de inzetbare uren"
             + (f", en niemand werkt liefst op meer dan {max_afd} afdelingen" if max_afd else "")
             + ". Dit gaat vóór de doelen hieronder: alleen als het echt niet anders kan, wijkt de planning ervan af, "
@@ -120,9 +126,10 @@ def pagina_toelichting() -> None:
         )
         _kaart(
             3, "De uren eerlijk verdelen",
-            f"Wie geen gz-psycholoog is, wordt liefst tussen {min_niet_gz}% en {max_niet_gz}% van de inzetbare uren "
+            f"Masterpsychologen worden liefst tussen {min_niet_gz}% en {max_niet_gz}% van de inzetbare uren "
             "ingepland. "
-            f"Gz-psychologen zitten zo dicht mogelijk bij {streef_gz}%. Daarna zijn binnen elke groep de uren zo "
+            f"Gz-psychologen zitten zo dicht mogelijk bij {streef_gz}%, PIOG'ers bij {streef_piog}% (hun inzetbare "
+            f"uren zijn al gecorrigeerd voor de lagere productiviteit). Daarna zijn binnen elke groep de uren zo "
             "gelijk mogelijk verdeeld (bezetting = ingeplande uren gedeeld door inzetbare uren). Dit zijn voorkeuren, "
             "geen harde grenzen. Er worden geen uren bijgemaakt, alleen verschoven, en alles in hele en halve uren.",
             "In te stellen bij Invoer → Extra eisen → Werkdruk.",
@@ -148,7 +155,7 @@ def pagina_toelichting() -> None:
             f"- {nooit}: nooit. Dit is een harde regel; geen enkele planning doet het.\n"
             f"- {liever}: liever niet, alleen als het echt niet anders kan (telt mee in doel 1)."
         )
-        st.caption("In te stellen bij Invoer → Extra eisen → Reizen beperken.")
+        st.caption("In te stellen bij Invoer → Extra eisen → Locaties combineren.")
 
     # ------------------------------------------------------------ regels
     st.subheader("De regels die altijd gelden")
@@ -167,8 +174,6 @@ def pagina_toelichting() -> None:
          "toch neer; dan werkt er ook een gz-psycholoog naast.", "Invoer → Afdelingen (Alleen gz)"),
         ("Maximum per afdeling", "Niet meer verschillende medewerkers op een afdeling dan het ingestelde maximum.",
          "Invoer → Afdelingen (Max. medewerkers)"),
-        ("Afdelingsgroep op één locatie", "Afdelingen met hetzelfde label (bv. GRZ) doet een medewerker op één locatie.",
-         "Invoer → Afdelingen (Afdelingsgroep)"),
         ("IDO", "Bij elke IDO is een psycholoog van de afdeling, en wie op een afdeling werkt, is bij minstens één "
          "IDO van die afdeling (en werkt dus op die dag). Werkt er maar één psycholoog, dan is die bij alle IDO's. "
          "Uitzondering: een afspraak 'Hoeft niet bij IDO'.",
@@ -178,7 +183,9 @@ def pagina_toelichting() -> None:
          "afdelingen (zelfde label bij 'Samen') telt als één.",
          "Invoer → Afdelingen (IDO's)"),
         ("Nooit combineren", f"Niemand werkt op twee locaties die nooit samen mogen (nu: {nooit}).",
-         "Invoer → Extra eisen → Reizen beperken"),
+         "Invoer → Extra eisen → Locaties combineren"),
+        ("Altijd samen", f"Wie op de ene locatie werkt, werkt ook op de andere (nu: {samen}).",
+         "Invoer → Extra eisen → Locaties combineren"),
         ("Afspraken", "Per medewerker: minstens of precies een aantal uren op een afdeling, groep of locatie, of daar "
          f"juist niet. 'Moet er werken' zonder aantal betekent minstens {nl_getal(MINIMUM_AANWEZIGHEID)} uur.",
          "Invoer → Extra eisen → Afspraken"),

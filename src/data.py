@@ -17,7 +17,8 @@ namen en kolommen als de tabbladen van planning_input.xlsx:
                    uren. Vervangt de oude tabellen MinimumUren en Bijsturing,
                    die bij het lezen automatisch worden omgezet.
 - Config:          key/value met locatie_1 en locatie_2 (het reispaar: liever
-                   niet combineren) en nooit_1 en nooit_2 (nooit combineren).
+                   niet combineren), nooit_1 en nooit_2 (nooit combineren) en
+                   samen_1 en samen_2 (wie op samen_1 werkt, werkt ook op samen_2).
 
 Die tabellen komen óf uit het Excel-bestand (load_excel_tables, gebruikt door
 het notebook), óf uit de database van de app (store.py). params_from_tables
@@ -32,8 +33,7 @@ Periode-specifieke vereisten (bv. "medewerker X moet minimaal Y uur GRZ op ONO
 doen", "max 1 medewerker op Lotus 2") staan niet hardcoded in model.py:
 - Requirements.max_medewerkers: headcount-cap per afdeling.
 - Requirements.afdelingsgroep: label (bv. "GRZ") waarmee afdelingen aan
-  elkaar gekoppeld worden; een medewerker die in zo'n groep werkt, moet dat
-  op één locatie doen (zie constraint 9 in model.py).
+  elkaar gekoppeld worden, zodat een afspraak voor de hele groep kan gelden.
 - Afspraken: per medewerker 'minimaal X uur', 'precies X uur' of
   'uitsluiten', voor een afdeling, een afdelingsgroep of een hele locatie.
   Uren leeg bij 'minimaal' betekent: moet er werken, aantal maakt niet uit.
@@ -65,13 +65,19 @@ AFTREK_KOLOMMEN = [
 # Productiviteit van een medewerker in opleiding (PIOG): telt voor 75%.
 PIOG_PRODUCTIVITEIT = 0.75
 
-# Basispsychologen (geen gz, niet in opleiding) liefst niet voller dan dit deel
-# van hun inzetbare uren. Standaardwaarde; in te stellen in de app (Config).
+# Drie groepen medewerkers: gz-psycholoog, PIOG (in opleiding, geen gz) en
+# masterpsycholoog (geen gz, niet in opleiding). In de code heet een
+# masterpsycholoog nog 'basis' / 'niet_gz' (zo staan de instellingen ook in Config).
+# Masterpsychologen liefst niet voller dan dit deel van hun inzetbare uren.
+# Standaardwaarde; in te stellen in de app (Config).
 MAX_BEZETTING_BASIS = 0.85
-# Streefwaarden bij het verdelen van de uren (sterke voorkeur, geen harde grens):
-# gz-psychologen zo dicht mogelijk bij STREEF_BEZETTING_GZ, de anderen liefst
-# niet onder MIN_BEZETTING_NIET_GZ. In te stellen in de app (Config).
+# Streefwaarden bij het verdelen van de uren (voorkeur, geen harde grens):
+# gz-psychologen zo dicht mogelijk bij STREEF_BEZETTING_GZ, PIOG'ers bij
+# STREEF_BEZETTING_PIOG (hun inzetbare uren zijn al gecorrigeerd voor
+# PIOG_PRODUCTIVITEIT), masterpsychologen liefst tussen MIN_ en
+# MAX_BEZETTING_NIET_GZ. In te stellen in de app (Config).
 STREEF_BEZETTING_GZ = 0.90
+STREEF_BEZETTING_PIOG = 1.00
 MIN_BEZETTING_NIET_GZ = 0.75
 MAX_BEZETTING_NIET_GZ = 0.85
 # Liefst niet meer afdelingen per medewerker dan dit (sterke voorkeur, geen
@@ -160,11 +166,14 @@ class Params:
     mdo_dag: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
     # Locatieparen die één medewerker nooit mag combineren (harde eis), bv. ONO en RK
     nooit_samen: list[tuple[str, str]] = field(default_factory=list)
+    # altijd_samen: [(a, b)]: wie op locatie a werkt, werkt ook op locatie b
+    altijd_samen: list[tuple[str, str]] = field(default_factory=list)
     # in_opleiding[e]: 1 = PIOG
     in_opleiding: dict[str, int] = field(default_factory=dict)
-    # Basispsychologen (geen gz, niet in opleiding): liefst niet voller dan dit deel van hun inzetbare uren
+    # Masterpsychologen (geen gz, niet in opleiding): liefst niet voller dan dit deel van hun inzetbare uren
     max_bezetting_basis: float = MAX_BEZETTING_BASIS
     streef_bezetting_gz: float = STREEF_BEZETTING_GZ
+    streef_bezetting_piog: float = STREEF_BEZETTING_PIOG
     min_bezetting_niet_gz: float = MIN_BEZETTING_NIET_GZ
     max_bezetting_niet_gz: float = MAX_BEZETTING_NIET_GZ
     # Liefst niet meer afdelingen per medewerker dan dit; 0 = geen maximum
@@ -256,7 +265,9 @@ def lees_tijd(waarde) -> int | None:
     """'12:30' / '12.30' / '9:00' / '9' -> minuten na middernacht; anders None."""
     if _leeg_naar_none(waarde) is None:
         return None
-    m = re.fullmatch(r"\s*(\d{1,2})(?:[:.](\d{2}))?\s*(?:uur)?\s*", str(waarde))
+    if hasattr(waarde, "hour") and hasattr(waarde, "minute"):  # tijd uit Excel
+        return waarde.hour * 60 + waarde.minute
+    m = re.fullmatch(r"\s*(\d{1,2})(?:[:.](\d{2}))?(?::\d{2})?\s*(?:uur)?\s*", str(waarde))
     if not m:
         return None
     uur, minuut = int(m.group(1)), int(m.group(2) or 0)
@@ -333,6 +344,9 @@ def normaliseer_tabellen(tabellen: dict[str, pd.DataFrame]) -> dict[str, pd.Data
                 df[kol] = df[kol].map(lambda w: _leeg_naar_none(w.strip() if isinstance(w, str) else w)).astype(object)
             elif not pd.api.types.is_numeric_dtype(df[kol]):
                 df[kol] = df[kol].map(lambda w: w.strip() if isinstance(w, str) else w)
+        if naam == "IDO":  # tijden altijd als '12:30' (ook als Excel er een tijdwaarde van maakte)
+            for kol in ["van", "tot"]:
+                df[kol] = df[kol].map(lambda w: tijd_tekst(lees_tijd(w)) or w if w is not None else None)
         sleutel = KOLOMMEN[naam][0]
         df = df[df[sleutel].map(_leeg_naar_none).notna()]
         result[naam] = df.reset_index(drop=True)
@@ -431,9 +445,11 @@ def _params_zonder_tijdelijk(tabellen: dict[str, pd.DataFrame]) -> Params:
         ido=ido,
         mdo_dag={dl: mdo_dagen([s[0] for s in slots]) for dl, slots in ido.items()},
         nooit_samen=_nooit_samen(config),
+        altijd_samen=_locatiepaar(config, "samen_1", "samen_2"),
         in_opleiding=dict(zip(E, pd.to_numeric(employees["In opleiding"], errors="coerce").fillna(0).astype(int))),
         max_bezetting_basis=_percentage(config, "max_bezetting_basis", MAX_BEZETTING_BASIS),
         streef_bezetting_gz=_percentage(config, "streef_bezetting_gz", STREEF_BEZETTING_GZ),
+        streef_bezetting_piog=_percentage(config, "streef_bezetting_piog", STREEF_BEZETTING_PIOG),
         min_bezetting_niet_gz=_percentage(config, "min_bezetting_niet_gz", MIN_BEZETTING_NIET_GZ),
         max_bezetting_niet_gz=_percentage(config, "max_bezetting_niet_gz", MAX_BEZETTING_NIET_GZ),
         max_afdelingen=_geheel_getal(config, "max_afdelingen", MAX_AFDELINGEN),
@@ -544,13 +560,23 @@ def _geheel_getal(config, sleutel: str, standaard: int) -> int:
 
 
 def is_basispsycholoog(p: "Params", e: str) -> bool:
-    """Geen gz-psycholoog en niet in opleiding."""
+    """Masterpsycholoog: geen gz-psycholoog en niet in opleiding."""
     return p.gz.get(e, 0) != 1 and p.in_opleiding.get(e, 0) != 1
+
+
+def is_piog(p: "Params", e: str) -> bool:
+    """In opleiding (PIOG) en (nog) geen gz-psycholoog."""
+    return p.gz.get(e, 0) != 1 and p.in_opleiding.get(e, 0) == 1
 
 
 def _nooit_samen(config) -> list[tuple[str, str]]:
     """Config nooit_1/nooit_2 -> [(a, b)]; leeg als niet (volledig) ingevuld."""
-    a, b = _leeg_naar_none(config.get("nooit_1")), _leeg_naar_none(config.get("nooit_2"))
+    return _locatiepaar(config, "nooit_1", "nooit_2")
+
+
+def _locatiepaar(config, sleutel_a: str, sleutel_b: str) -> list[tuple[str, str]]:
+    """Twee Config-locaties -> [(a, b)]; leeg als niet (volledig) ingevuld."""
+    a, b = _leeg_naar_none(config.get(sleutel_a)), _leeg_naar_none(config.get(sleutel_b))
     return [(str(a), str(b))] if a is not None and b is not None else []
 
 
@@ -580,6 +606,14 @@ def valideer(p: Params) -> list[str]:
                 fouten.append(f"Instelling 'nooit combineren': '{loc}' is geen bekende locatie.")
         if {a, b} == {p.l1, p.l2}:
             fouten.append(f"{a} en {b} staan zowel bij 'nooit' als bij 'liever niet' combineren; kies er één.")
+    for a, b in p.altijd_samen:
+        if a == b:
+            fouten.append("Instelling 'altijd samen': kies twee verschillende locaties.")
+        for loc in (a, b):
+            if loc not in L:
+                fouten.append(f"Instelling 'altijd samen': '{loc}' is geen bekende locatie.")
+        if any({a, b} == {c, d} for c, d in p.nooit_samen):
+            fouten.append(f"{a} en {b} staan zowel bij 'nooit combineren' als bij 'altijd samen'; kies er één.")
     for (e, d, l) in p.cur:
         if e not in E:
             fouten.append(f"Huidige planning: medewerker '{e}' bestaat niet.")

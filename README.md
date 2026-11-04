@@ -4,7 +4,7 @@ Webapp die de weekplanning van psychologen over afdelingen en locaties maakt.
 Een optimalisatiemodel verdeelt de vereiste uren over de medewerkers en houdt
 daarbij rekening met (op volgorde):
 
-0. **basispsychologen** (geen gz, niet in opleiding) liefst niet voller dan een
+0. **masterpsychologen** (geen gz, niet in opleiding) liefst niet voller dan een
    in te stellen percentage (standaard 85%) van hun inzetbare uren, en niemand
    liefst op meer dan een in te stellen aantal afdelingen (standaard 5);
 1. **zo min mogelijk wijzigingen** ten opzichte van de huidige planning én
@@ -12,17 +12,17 @@ daarbij rekening met (op volgorde):
    combineren", bv. ONO en LH); die twee tellen even zwaar;
 2. daarbinnen bij afdelingen met meerdere IDO's **liefst een
    gz-psycholoog bij alle IDO's**;
-3. daarbinnen de uren **eerlijk verdelen**: medewerkers zonder gz liefst tussen
-   75% en 85%, gz-psychologen zo dicht mogelijk bij 90% van hun inzetbare uren
-   (beide in te stellen), en binnen elke groep iedereen ongeveer even vol, in
-   hele of halve uren;
+3. daarbinnen de uren **eerlijk verdelen**: masterpsychologen liefst tussen
+   75% en 85%, gz-psychologen zo dicht mogelijk bij 90% en PIOG'ers bij 100%
+   van hun inzetbare uren (alle in te stellen), en binnen elke groep iedereen
+   ongeveer even vol, in hele of halve uren;
 4. daarbinnen **zo weinig mogelijk medewerkers per afdeling**.
 
 Harde regels: vereiste uren per afdeling/locatie worden gedekt, niemand werkt
 meer dan de inzetbare tijd, minimaal één gz-psycholoog per locatie, sommige
 afdelingen alleen voor gz-psychologen, en optioneel: maximum aantal
-medewerkers per afdeling, afdelingsgroepen op één locatie, verplichte
-IDO's (dag, even/oneven weken en tijd; niemand bij twee IDO's tegelijk), locaties die nooit gecombineerd mogen worden (bv. ONO en RK) en
+medewerkers per afdeling, verplichte
+IDO's (dag, even/oneven weken en tijd; niemand bij twee IDO's tegelijk), locaties die nooit gecombineerd mogen worden (bv. LH en RK), locaties die altijd samen gaan (wie op Rijnhof werkt, werkt ook op ONO) en
 afspraken per medewerker (minimaal/precies X uur, of uitsluiten; voor een
 afdeling, een afdelingsgroep of een hele locatie).
 
@@ -111,7 +111,7 @@ regelmatig een back-up van.
   gedeelde database (bijv. PostgreSQL) de logische volgende stap. Alleen
   `src/store.py` hoeft dan te veranderen.
 - **Rekentijd en geheugen:** een planning kost bij ~15 medewerkers en ~35
-  afdeling/locatie-combinaties 5 à 10 minuten (maximaal ~16) rekentijd op één CPU-kern en
+  afdeling/locatie-combinaties 5 à 10 minuten (hooguit 5 minuten per rekenstap) rekentijd op één CPU-kern en
   weinig geheugen (< 500 MB).
 - **Instellingen:** het pad van de database is in te stellen met de
   omgevingsvariabele `PLANNING_DB` (standaard `data/planning.db`).

@@ -239,9 +239,10 @@ def _dialoog_verdeling(p: Params, rooster: pd.DataFrame, oud: pd.DataFrame, labe
     nieuw, vorig = bezetting_per_medewerker(p, rooster), bezetting_per_medewerker(p, oud)
     laag, hoog = bezetting_bereik(p, rooster)
     st.markdown(
-        "Bezetting = ingeplande uren gedeeld door inzetbare uren. Derde doel: medewerkers zonder gz liefst tussen "
+        "Bezetting = ingeplande uren gedeeld door inzetbare uren. Derde doel: masterpsychologen liefst tussen "
         f"{round(p.min_bezetting_niet_gz * 100)}% en {round(p.max_bezetting_niet_gz * 100)}%, gz-psychologen zo dicht mogelijk bij "
-        f"{round(p.streef_bezetting_gz * 100)}%, en binnen elke groep iedereen ongeveer even vol, "
+        f"{round(p.streef_bezetting_gz * 100)}%, PIOG'ers bij {round(p.streef_bezetting_piog * 100)}%, "
+        "en binnen elke groep iedereen ongeveer even vol, "
         f"zonder dat de eerste twee doelen slechter worden. In deze planning zit iedereen tussen **{laag}%** en "
         f"**{hoog}%**. Medewerkers met 0 inzetbare uren staan er niet bij."
     )
@@ -308,8 +309,8 @@ def toon_kerncijfers(p: Params, rooster: pd.DataFrame, oud: pd.DataFrame, sleute
             "Bezetting", f"{b_laag}–{b_hoog}%",
             delta=f"{label_oud}: {o_laag}–{o_hoog}%", delta_color="off", delta_arrow="off",
             help="Ingeplande uren gedeeld door inzetbare uren: van de minst tot de meest bezette medewerker. "
-            f"Derde doel: niet-gz liefst tussen {round(p.min_bezetting_niet_gz * 100)}% en {round(p.max_bezetting_niet_gz * 100)}%, gz zo dicht mogelijk bij "
-            f"{round(p.streef_bezetting_gz * 100)}%, en binnen elke groep zo gelijk mogelijk. "
+            f"Derde doel: masterpsychologen liefst tussen {round(p.min_bezetting_niet_gz * 100)}% en {round(p.max_bezetting_niet_gz * 100)}%, gz zo dicht mogelijk bij "
+            f"{round(p.streef_bezetting_gz * 100)}%, PIOG bij {round(p.streef_bezetting_piog * 100)}%, en binnen elke groep zo gelijk mogelijk. "
             "De uren worden daarbij in hele of halve uren ingepland.",
         )
         if st.button("Details", icon=":material/open_in_full:", type="tertiary", key=f"{sleutel}_d5"):
@@ -496,15 +497,17 @@ def pagina_planning() -> None:
         if start_planning():
             st.rerun()
     c2.caption(
-        f"Berekent het beste rooster op basis van de opgeslagen invoer: basispsychologen liefst niet boven "
+        f"Berekent het beste rooster op basis van de opgeslagen invoer: masterpsychologen liefst niet boven "
         f"{round(p.max_bezetting_basis * 100)}%"
         + (f" en niemand op meer dan {p.max_afdelingen} afdelingen" if p.max_afdelingen else "")
         + ", dan zo min mogelijk wijzigingen en "
         f"reizen tussen {p.l1} en {p.l2} (even belangrijk), dan liefst een gz-psycholoog bij alle IDO's, "
-        f"dan de uren eerlijk verdelen (gz rond {round(p.streef_bezetting_gz * 100)}%, anderen liefst tussen "
+        f"dan de uren eerlijk verdelen (gz rond {round(p.streef_bezetting_gz * 100)}%, PIOG rond "
+        f"{round(p.streef_bezetting_piog * 100)}%, masterpsychologen liefst tussen "
         f"{round(p.min_bezetting_niet_gz * 100)}% en {round(p.max_bezetting_niet_gz * 100)}%), "
         "en tot slot zo min mogelijk mensen per afdeling. "
         + "".join(f"{a} en {b} worden nooit gecombineerd. " for a, b in p.nooit_samen)
+        + "".join(f"Wie op {a} werkt, werkt ook op {b}. " for a, b in p.altijd_samen)
         + "Dit duurt meestal 5 à 10 minuten; je kunt intussen gewoon verder werken."
     )
     _voortgang_hoofd()
@@ -539,7 +542,7 @@ def pagina_planning() -> None:
         )
     if kpi.get("boven_max_basis"):
         st.warning(
-            f"Het lukte niet om alle basispsychologen onder {round(p.max_bezetting_basis * 100)}% van hun inzetbare uren "
+            f"Het lukte niet om alle masterpsychologen onder {round(p.max_bezetting_basis * 100)}% van hun inzetbare uren "
             "te houden: " + ", ".join(f"{e} ({_uren(u)} uur erboven)" for e, u in kpi["boven_max_basis"].items())
             + ". Zonder die extra uren is er geen planning mogelijk.",
             icon=":material/trending_up:",

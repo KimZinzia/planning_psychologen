@@ -1,30 +1,40 @@
 """Lost het model lexicografisch op. Allereerst: zo veel mogelijk zorg dekken
 (bij te weinig formatie zo min mogelijk tekort, eerlijk verdeeld, afdelingen
-met voorrang zo min mogelijk gekort). Dan: basispsychologen liefst niet boven
+met voorrang zo min mogelijk gekort). Dan: masterpsychologen liefst niet boven
 hun maximale bezetting (zie model.add_basis_constraints) en niemand liefst op
 meer dan p.max_afdelingen afdelingen. Daarna vier doelen:
 1. zo min mogelijk wijzigingen ten opzichte van de huidige planning én zo
    weinig mogelijk reizigers (even belangrijk, zie REIS_GEWICHT);
 2. bij afdelingen met meerdere IDO-dagen: liefst een gz-psycholoog die bij
    alle IDO's is (zie model.add_mdo_constraints);
-3. de uren eerlijk verdelen: niet-gz liefst tussen hun minimum en maximum, gz rond hun
-   streefwaarde, binnen elke groep zo gelijk mogelijk (in halve uren);
+3. de uren eerlijk verdelen: masterpsychologen liefst tussen hun minimum en
+   maximum, gz en PIOG rond hun streefwaarde, binnen elke groep zo gelijk
+   mogelijk (in halve uren);
 4. tot slot zo min mogelijk medewerkers per afdeling.
 
 Solver: HiGHS (open-source, via het pip-pakket highspy), aangestuurd via PuLP.
 """
 
 import math
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import pandas as pd
 import pulp
 
-from data import Params, ido_tekst
+from data import Params, ido_tekst, is_basispsycholoog, is_piog
 from model import CONSTRAINT_GROEPEN, Variabelen, build_model
 
 TIJDSLIMIET_PER_STAP = 300  # seconden; meer tijd = grotere kans op het allerbeste rooster
+# Sommige stappen bestaan uit meerdere rekenrondes; die delen samen de tijd van
+# de stap. Een ronde krijgt wel altijd minimaal MINIMUM_RONDE seconden, zodat hij
+# de oplossing van de vorige ronde kan overnemen (een stap kan dus iets uitlopen).
+MINIMUM_RONDE = 10
+
+# Einde van de lopende stap (per thread: de app kan tegelijk plannen en controleren).
+_stap = threading.local()
 
 # Stappen van plan(), voor de voortgangsmelding. Elke stap duurt hooguit
 # TIJDSLIMIET_PER_STAP seconden.
@@ -74,7 +84,15 @@ def _solver(msg: bool = False, warm_start: bool = False, zoekintensiteit: float 
     # afdeling), maar vertraagt doel 1; daarom alleen daar gebruikt.
     extra = {} if zoekintensiteit is None else {"mip_heuristic_effort": zoekintensiteit}
     # gap: voor de doelen met gehele getallen 0.999, voor het verdelen GAP_VERDELING.
-    return pulp.HiGHS(msg=msg, gapAbs=gap, timeLimit=TIJDSLIMIET_PER_STAP, warmStart=warm_start, **extra)
+    return pulp.HiGHS(msg=msg, gapAbs=gap, timeLimit=_resterende_tijd(), warmStart=warm_start, **extra)
+
+
+def _resterende_tijd() -> float:
+    """Seconden die de huidige rekenronde mag duren: wat er over is van de stap."""
+    einde = getattr(_stap, "einde", None)
+    if einde is None:
+        return TIJDSLIMIET_PER_STAP
+    return max(einde - time.time(), MINIMUM_RONDE)
 
 
 def _los_op(
@@ -155,7 +173,7 @@ def solve_lexicographic(
     niet_bewezen: list[str] = []
     tekort = _dek_zorg(model, p, v, msg, niet_bewezen, voortgang)
 
-    # --- Dan: werkdruk (basispsychologen niet te vol, niet te veel afdelingen) ---
+    # --- Dan: werkdruk (masterpsychologen niet te vol, niet te veel afdelingen) ---
     voortgang(3, STAPPEN[2])
     boven_max, teveel_afd = _werkdruk(model, p, v, msg, niet_bewezen)
 
@@ -181,7 +199,7 @@ def solve_lexicographic(
         zonder_gz = _som(v.mdo_zonder_gz.values())
         model += mdo_doel <= zonder_gz, "fix_mdo_gz"
 
-    # --- Doel 3: uren eerlijk verdelen (niet-gz minimum, gz streefwaarde, binnen groepen gelijk) ---
+    # --- Doel 3: uren eerlijk verdelen (master tussen min en max, gz en PIOG rond streefwaarde, binnen groepen gelijk) ---
     # Vóór 'mensen per afdeling': gemeten op de echte invoer sneller, en een
     # eerlijkere verdeling van de uren.
     voortgang(6, STAPPEN[5])
@@ -269,17 +287,17 @@ def _werkdruk(
     model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool, niet_bewezen: list[str]
 ) -> tuple[dict[str, float], dict[str, int]]:
     """Na het dekken van de zorg, vóór doel 1 (sterke voorkeuren):
-    a. basispsychologen liefst niet boven hun maximale bezetting
+    a. masterpsychologen liefst niet boven hun maximale bezetting
        (zie model.add_basis_constraints);
     b. niemand liefst op meer dan p.max_afdelingen afdelingen (0 = geen maximum).
-    Geeft terug: uren boven het maximum per basispsycholoog, en het aantal
+    Geeft terug: uren boven het maximum per masterpsycholoog, en het aantal
     afdelingen boven het maximum per medewerker."""
     boven_max: dict[str, float] = {}
     if v.boven_max:
         _ruim_op(p, v)
         overschrijding = pulp.lpSum(v.boven_max.values())
         model.setObjective(overschrijding)
-        _los_op(model, "basispsychologen niet te vol", msg, niet_bewezen, gap=0.49)
+        _los_op(model, "masterpsychologen niet te vol", msg, niet_bewezen, gap=0.49)
         _ruim_op(p, v)
         waarde = pulp.value(overschrijding)
         model += overschrijding <= waarde + 0.01, "fix_basis"
@@ -306,13 +324,14 @@ def _verdeel_gelijk(model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool, 
     in procenten. Medewerkers met 0 inzetbare uren tellen niet mee.
 
     In drie stappen, allemaal voorkeuren (geen harde grenzen):
-    a. Medewerkers zonder gz-registratie liefst tussen p.min_bezetting_niet_gz
-       en p.max_bezetting_niet_gz (bv. 75% en 85%): zo min mogelijk uren
-       eronder of erboven.
-    b. Gz-psychologen zo dicht mogelijk bij p.streef_bezetting_gz (bv. 90%):
-       zo min mogelijk uren afwijking, naar boven of naar beneden.
-    c. Daarna binnen elke groep (gz en niet-gz) zo gelijk mogelijk: het
-       verschil tussen hoogste en laagste bezetting, opgeteld over beide groepen.
+    a. Masterpsychologen (geen gz, niet in opleiding) liefst tussen
+       p.min_bezetting_niet_gz en p.max_bezetting_niet_gz (bv. 75% en 85%):
+       zo min mogelijk uren eronder of erboven.
+    b. Gz-psychologen zo dicht mogelijk bij p.streef_bezetting_gz (bv. 90%) en
+       PIOG'ers bij p.streef_bezetting_piog (bv. 100%): zo min mogelijk uren
+       afwijking, naar boven of naar beneden.
+    c. Daarna binnen elke groep (gz, PIOG, master) zo gelijk mogelijk: het
+       verschil tussen hoogste en laagste bezetting, opgeteld over de groepen.
     Elke stap houdt de uitkomst van de vorige vast.
 
     De uitkomst van doel 1 en 2 blijft daarbij gelijk (die zijn vastgezet), en
@@ -343,7 +362,8 @@ def _verdeel_gelijk(model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool, 
 
     groepen = {
         "gz": [e for e in medewerkers if p.gz.get(e, 0) == 1],
-        "overig": [e for e in medewerkers if p.gz.get(e, 0) != 1],
+        "piog": [e for e in medewerkers if is_piog(p, e)],
+        "overig": [e for e in medewerkers if is_basispsycholoog(p, e)],
     }
     spreiding = []
     for naam, groep in groepen.items():
@@ -359,22 +379,23 @@ def _verdeel_gelijk(model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool, 
     def uren(e):
         return pulp.lpSum(v.x[e, d, l] for (d, l) in v.dl_pairs)
 
-    # a. niet-gz liefst tussen de minimale en maximale bezetting
+    # a. masterpsychologen liefst tussen de minimale en maximale bezetting
     onder = {}
     for i, e in enumerate(groepen["overig"]):
         onder[e] = model.add_variable(f"onder_min_{i}", lowBound=0)
         model += uren(e) + onder[e] >= p.min_bezetting_niet_gz * p.avail[e]
         onder[e, "boven"] = model.add_variable(f"boven_max_ng_{i}", lowBound=0)
         model += uren(e) - p.max_bezetting_niet_gz * p.avail[e] <= onder[e, "boven"]
-    # b. gz zo dicht mogelijk bij de streefbezetting
+    # b. gz en PIOG zo dicht mogelijk bij hun streefbezetting
     afwijking = {}
-    for i, e in enumerate(groepen["gz"]):
-        afwijking[e] = model.add_variable(f"afwijking_gz_{i}", lowBound=0)
-        model += uren(e) - p.streef_bezetting_gz * p.avail[e] <= afwijking[e]
-        model += p.streef_bezetting_gz * p.avail[e] - uren(e) <= afwijking[e]
+    for i, e in enumerate(groepen["gz"] + groepen["piog"]):
+        streef = p.streef_bezetting_gz if p.gz.get(e, 0) == 1 else p.streef_bezetting_piog
+        afwijking[e] = model.add_variable(f"afwijking_streef_{i}", lowBound=0)
+        model += uren(e) - streef * p.avail[e] <= afwijking[e]
+        model += streef * p.avail[e] - uren(e) <= afwijking[e]
 
     try:
-        for naam, termen in [("niet-gz tussen min en max", onder), ("gz rond streefwaarde", afwijking)]:
+        for naam, termen in [("master tussen min en max", onder), ("gz en PIOG rond streefwaarde", afwijking)]:
             if not termen:
                 continue
             som = pulp.lpSum(termen.values())
@@ -457,17 +478,26 @@ class Resultaat:
 def plan(p: Params, msg: bool = False, voortgang: Voortgang = _geen_voortgang) -> Resultaat:
     """Bouwt en lost het model op. Gooit OnoplosbaarError als er geen
     planning mogelijk is, met de vermoedelijke oorzaken erbij."""
-    voortgang(1, STAPPEN[0])
-    model, v = build_model(p)
-    model.setObjective(0)
-    status = model.solve(_solver(msg)).status
-    if status == pulp.LpSolveStatus.TimeLimit:
-        raise RuntimeError("De solver vond binnen de tijdslimiet geen planning.")
-    if status != pulp.LpSolveStatus.Optimal:
-        voortgang(1, "Geen planning mogelijk; knelpunt zoeken")
-        raise OnoplosbaarError("Er is geen planning mogelijk die aan alle regels voldoet.", diagnose(p))
-    kpi = solve_lexicographic(model, p, v, msg, voortgang)
-    return Resultaat(kpi=kpi, rooster=extract_schedule(p, v))
+
+    def nieuwe_stap(nummer: int, omschrijving: str) -> None:
+        _stap.einde = time.time() + TIJDSLIMIET_PER_STAP
+        voortgang(nummer, omschrijving)
+
+    try:
+        nieuwe_stap(1, STAPPEN[0])
+        model, v = build_model(p)
+        model.setObjective(0)
+        status = model.solve(_solver(msg)).status
+        if status == pulp.LpSolveStatus.TimeLimit:
+            raise RuntimeError("De solver vond binnen de tijdslimiet geen planning.")
+        if status != pulp.LpSolveStatus.Optimal:
+            voortgang(1, "Geen planning mogelijk; knelpunt zoeken")
+            _stap.einde = None  # elke controle in de knelpuntzoektocht krijgt de volle tijd
+            raise OnoplosbaarError("Er is geen planning mogelijk die aan alle regels voldoet.", diagnose(p))
+        kpi = solve_lexicographic(model, p, v, msg, nieuwe_stap)
+        return Resultaat(kpi=kpi, rooster=extract_schedule(p, v))
+    finally:
+        _stap.einde = None
 
 
 def compare_headcount(p: Params, schedule: pd.DataFrame) -> pd.DataFrame:
