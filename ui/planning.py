@@ -116,7 +116,7 @@ def _toon_afloop() -> None:
         else:
             tekst += (
                 "Het knelpunt zit in een combinatie van meerdere groepen regels. Controleer vooral of de inzetbare tijd "
-                "de vereiste uren dekt, en of de afspraken (Extra eisen) en MDO-dagen niet te krap zijn."
+                "de vereiste uren dekt, en of de afspraken (Extra eisen) en IDO's niet te krap zijn."
             )
         st.error(tekst, icon=":material/error:")
     elif taak.geslaagd:
@@ -329,9 +329,10 @@ def toon_kerncijfers(p: Params, rooster: pd.DataFrame, oud: pd.DataFrame, sleute
 
 def toon_rooster(
     p: Params, rooster: pd.DataFrame, oud: pd.DataFrame, sleutel: str,
-    label_oud: str = "Nu", label_nieuw: str = "Nieuw",
+    label_oud: str = "Nu", label_nieuw: str = "Nieuw", ido: list[dict] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Toont een rooster in vier tabbladen, vergeleken met `oud`.
+    `ido`: wie bij welke IDO is (kpi['ido'] van solve.plan), als dat bekend is.
     Geeft de getoonde tabellen terug (voor de Excel-download)."""
     cmp = vergelijk_roosters(oud, rooster)
     cmp["Status"] = cmp["status"].map(STATUS_LABELS)
@@ -383,6 +384,9 @@ def toon_rooster(
                 f"Afdelingen {label_nieuw.lower()}": r["afdeling"].nunique(),
                 "Locaties": ", ".join(sorted(set(r["locatie"]))),
                 "Rooster": "  ·  ".join(f"{a} ({l}) {_uren(u)}" for a, l, u in zip(r["afdeling"], r["locatie"], r["uren"])),
+                **({"IDO's": "  ·  ".join(
+                    f"{i['afdeling']}: {i['ido']}" for i in sorted(ido, key=lambda i: i["ido"]) if i["medewerker"] == e
+                )} if ido is not None else {}),
             })
         per_med = pd.DataFrame(rijen)
         # De kolom Rooster krijgt de breedte van de langste tekst (± 7,5 px per teken), zodat
@@ -394,6 +398,7 @@ def toon_rooster(
             column_config={
                 "Medewerker": st.column_config.TextColumn(pinned=True),
                 "Rooster": st.column_config.TextColumn(width=max(400, min(int(langste * 7.5) + 24, 2400))),
+                "IDO's": st.column_config.TextColumn(width="large", help="Bij welke IDO's deze medewerker is"),
             },
         )
         st.caption("Schuif de tabel naar rechts (shift + scrollen, of de schuifbalk onderaan) om het hele rooster te zien.")
@@ -492,8 +497,10 @@ def pagina_planning() -> None:
             st.rerun()
     c2.caption(
         f"Berekent het beste rooster op basis van de opgeslagen invoer: basispsychologen liefst niet boven "
-        f"{round(p.max_bezetting_basis * 100)}%, dan zo min mogelijk wijzigingen en "
-        f"reizen tussen {p.l1} en {p.l2} (even belangrijk), dan liefst een gz-psycholoog bij alle MDO's, "
+        f"{round(p.max_bezetting_basis * 100)}%"
+        + (f" en niemand op meer dan {p.max_afdelingen} afdelingen" if p.max_afdelingen else "")
+        + ", dan zo min mogelijk wijzigingen en "
+        f"reizen tussen {p.l1} en {p.l2} (even belangrijk), dan liefst een gz-psycholoog bij alle IDO's, "
         f"dan de uren eerlijk verdelen (gz rond {round(p.streef_bezetting_gz * 100)}%, anderen liefst tussen "
         f"{round(p.min_bezetting_niet_gz * 100)}% en {round(p.max_bezetting_niet_gz * 100)}%), "
         "en tot slot zo min mogelijk mensen per afdeling. "
@@ -537,17 +544,24 @@ def pagina_planning() -> None:
             + ". Zonder die extra uren is er geen planning mogelijk.",
             icon=":material/trending_up:",
         )
+    if kpi.get("teveel_afdelingen"):
+        st.warning(
+            f"Het lukte niet om iedereen op maximaal {p.max_afdelingen} afdelingen te houden: "
+            + ", ".join(f"{e} ({p.max_afdelingen + n} afdelingen)" for e, n in kpi["teveel_afdelingen"].items())
+            + ". Zonder die extra afdelingen is er geen planning mogelijk.",
+            icon=":material/call_split:",
+        )
     if kpi.get("mdo_zonder_gz"):
         st.info(
-            "Bij deze afdeling(en) met meerdere MDO-dagen is geen gz-psycholoog bij álle MDO's: "
-            f"{', '.join(kpi['mdo_zonder_gz'])}. Elk MDO heeft wel een psycholoog. Een gz-psycholoog erbij zou "
+            "Bij deze afdeling(en) met meerdere IDO's is geen gz-psycholoog bij álle IDO's: "
+            f"{', '.join(kpi['mdo_zonder_gz'])}. Elke IDO heeft wel een psycholoog. Een gz-psycholoog erbij zou "
             "extra wijzigingen of reizen kosten; wil je het toch, zet dan iemand vast via Invoer → Extra eisen.",
             icon=":material/groups:",
         )
 
     oud = huidig_rooster(p)
     toon_kerncijfers(p, rooster, oud, sleutel="plan")
-    tabellen_export = toon_rooster(p, rooster, oud, sleutel="plan")
+    tabellen_export = toon_rooster(p, rooster, oud, sleutel="plan", ido=kpi.get("ido"))
 
     st.divider()
     a1, a2, a3 = st.columns(3)

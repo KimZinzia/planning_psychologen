@@ -5,12 +5,13 @@ Een optimalisatiemodel verdeelt de vereiste uren over de medewerkers en houdt
 daarbij rekening met (op volgorde):
 
 0. **basispsychologen** (geen gz, niet in opleiding) liefst niet voller dan een
-   in te stellen percentage (standaard 85%) van hun inzetbare uren;
+   in te stellen percentage (standaard 85%) van hun inzetbare uren, en niemand
+   liefst op meer dan een in te stellen aantal afdelingen (standaard 5);
 1. **zo min mogelijk wijzigingen** ten opzichte van de huidige planning én
    **zo weinig mogelijk reizen** tussen twee ingestelde locaties ("liever niet
    combineren", bv. ONO en LH); die twee tellen even zwaar;
-2. daarbinnen bij afdelingen met meerdere MDO-dagen **liefst een
-   gz-psycholoog bij alle MDO's**;
+2. daarbinnen bij afdelingen met meerdere IDO's **liefst een
+   gz-psycholoog bij alle IDO's**;
 3. daarbinnen de uren **eerlijk verdelen**: medewerkers zonder gz liefst tussen
    75% en 85%, gz-psychologen zo dicht mogelijk bij 90% van hun inzetbare uren
    (beide in te stellen), en binnen elke groep iedereen ongeveer even vol, in
@@ -21,7 +22,7 @@ Harde regels: vereiste uren per afdeling/locatie worden gedekt, niemand werkt
 meer dan de inzetbare tijd, minimaal één gz-psycholoog per locatie, sommige
 afdelingen alleen voor gz-psychologen, en optioneel: maximum aantal
 medewerkers per afdeling, afdelingsgroepen op één locatie, verplichte
-MDO-dagen, locaties die nooit gecombineerd mogen worden (bv. ONO en RK) en
+IDO's (dag, even/oneven weken en tijd; niemand bij twee IDO's tegelijk), locaties die nooit gecombineerd mogen worden (bv. ONO en RK) en
 afspraken per medewerker (minimaal/precies X uur, of uitsluiten; voor een
 afdeling, een afdelingsgroep of een hele locatie).
 
@@ -34,14 +35,14 @@ de webinterface.
 
 | Pagina | Wat je er doet |
 |---|---|
-| **Invoer** | Team (contracturen, aftrekposten, werkdagen), afdelingen (met MDO-dag), huidige planning en extra eisen (afspraken per medewerker en reisregels) bijhouden. Medewerkers voer je op één plek in; elders kies je ze uit een lijst. Hernoemen of verwijderen werkt automatisch door in de andere tabellen. |
+| **Invoer** | Team (contracturen, aftrekposten, werkdagen), afdelingen (met IDO's), huidige planning en extra eisen (afspraken per medewerker en reisregels) bijhouden. Medewerkers voer je op één plek in; elders kies je ze uit een lijst. Hernoemen of verwijderen werkt automatisch door in de andere tabellen. |
 | **Planning** | Op *Plan maken* klikken (duurt 5 à 10 minuten), het rooster bekijken, de wijzigingen ten opzichte van de huidige planning zien en het resultaat als Excel downloaden. Een goedgekeurd rooster kan worden overgenomen als nieuwe huidige planning. |
 | **Noodplanning** | Tijdelijke aanpassingen met einddatum bij krappe formatie: andere uren per afdeling, meer/minder uren per medewerker, regels tijdelijk loslaten. Bij te weinig formatie maakt de planning ook zonder aanpassingen een rooster en verdeelt het tekort eerlijk (afdelingen met voorrang zo min mogelijk). |
 | **Archief** | Bewaarde planningen (bijv. per periode) terugkijken en met elkaar of met de huidige planning vergelijken. |
 | **Toelichting** | De doelen en regels van het model in gewone taal, met voorbeelden (en de formules voor wie dat wil). |
 
 Bovenaan Invoer en Planning staan automatische **aandachtspunten**, zoals te
-weinig ruimte, of een afdeling waar op de MDO-dag niemand kan zijn. Onderaan
+weinig ruimte, of een afdeling waar op de IDO-dag niemand kan zijn. Onderaan
 Invoer staat een **back-up**: alle invoer downloaden als Excel en terugzetten.
 
 Is er geen planning mogelijk, dan laat de app zien welke groep regels het

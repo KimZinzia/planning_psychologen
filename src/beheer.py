@@ -157,17 +157,18 @@ def wijzig_vereisten(t: Tabellen, nieuw: pd.DataFrame) -> tuple[Tabellen, list[s
     t["Requirements"] = nieuw
     meldingen = [f"Afdeling '{o}' heet nu '{n}' (ook aangepast in de andere tabellen)." for o, n in afd_hernoemd.items()]
 
-    # Huidige planning: per (afdeling, locatie) meeverhuizen of weghalen.
-    cs = t["CurrentSchedule"].copy()
-    if len(cs):
-        cs_paren = [paar_hernoemd.get((d, l), (d, l)) for d, l in zip(cs["afdeling"], cs["locatie"])]
-        cs["afdeling"] = [d for d, _ in cs_paren]
-        cs["locatie"] = [l for _, l in cs_paren]
-        voor = len(cs)
-        cs = cs[pd.Series([p in nieuwe_paren for p in cs_paren], index=cs.index, dtype=bool)]
-        if voor - len(cs):
-            meldingen.append(f"{_meervoud(voor - len(cs), 'regel', 'regels')} van verwijderde afdelingen weggehaald uit de huidige planning.")
-    t["CurrentSchedule"] = cs
+    # Huidige planning en IDO's: per (afdeling, locatie) meeverhuizen of weghalen.
+    for tabel in ["CurrentSchedule", "IDO"]:
+        cs = t[tabel].copy()
+        if len(cs):
+            cs_paren = [paar_hernoemd.get((d, l), (d, l)) for d, l in zip(cs["afdeling"], cs["locatie"])]
+            cs["afdeling"] = [d for d, _ in cs_paren]
+            cs["locatie"] = [l for _, l in cs_paren]
+            voor = len(cs)
+            cs = cs[pd.Series([p in nieuwe_paren for p in cs_paren], index=cs.index, dtype=bool)]
+            if voor - len(cs):
+                meldingen.append(f"{_meervoud(voor - len(cs), 'regel', 'regels')} van verwijderde afdelingen weggehaald uit {tabel_label(tabel)}.")
+        t[tabel] = cs
 
     # Afspraken: afdelingsnaam meenemen; regels die niet meer kloppen weghalen.
     for tabel in ["Afspraken", "TijdelijkAfdeling"]:
@@ -190,5 +191,6 @@ def tabel_label(tabel: str) -> str:
         "CurrentSchedule": "de huidige planning",
         "Afspraken": "de afspraken",
         "TijdelijkAfdeling": "de noodplanning",
+        "IDO": "de IDO's",
         "TijdelijkMedewerker": "de noodplanning",
     }.get(tabel, tabel)

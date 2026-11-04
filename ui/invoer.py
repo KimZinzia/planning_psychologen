@@ -27,8 +27,10 @@ from data import (
     bereken_uren_opbouw,
     is_basispsycholoog,
     load_excel_tables,
+    WEKEN,
+    lees_tijd,
     mdo_dagen,
-    mdo_tekst,
+    tijd_tekst,
     params_from_tables,
     valideer,
 )
@@ -61,6 +63,9 @@ AFTREK_LABELS = {
     "Opleidingstijd": "Opleidingstijd",
     "Coordinerende taken": "Coördinerende taken",
 }
+
+WEKEN_LABELS = {"elke": "Elke week", "even": "Even weken", "oneven": "Oneven weken"}
+TIJD_PATROON = r"^\s*([01]?\d|2[0-3])([:.][0-5]\d)?\s*$"
 
 UITLEG_RIJEN = (
     ":material/add_circle: **Toevoegen:** klik op de lege rij onderaan de tabel.  \n"
@@ -188,7 +193,7 @@ def _tab_team(tabellen, inzetbaar: pd.Series) -> None:
                         "🔒 Inzetbaar", disabled=True,
                         help="Contracturen min de aftrekposten hieronder; daarvan 75% bij een PIOG; 0 bij zwangerschapsverlof. Wordt bijgewerkt na opslaan.",
                     ),
-                    **{d: st.column_config.CheckboxColumn(DAG_LABELS[d], default=False, help="Werkt op deze dag. Telt mee voor de MDO's: iemand wordt alleen ingepland op een afdeling als die op de MDO-dag werkt.") for d in WERKDAGEN},
+                    **{d: st.column_config.CheckboxColumn(DAG_LABELS[d], default=False, help="Werkt op deze dag. Telt mee voor de IDO's: iemand wordt alleen ingepland op een afdeling als die bij een IDO van die afdeling kan zijn.") for d in WERKDAGEN},
                 },
             )
             if st.form_submit_button("Opslaan", type="primary", disabled=achtergrond.bezig()):
@@ -246,10 +251,6 @@ def _tab_afdelingen(tabellen) -> None:
         )
         with st.expander("Uitleg van de kolommen"):
             st.markdown(
-                "- **MDO-dag**: de dag van het MDO. Alleen medewerkers die op die dag werken, kunnen op deze "
-                "afdeling worden ingepland (leeg = geen MDO). Heeft een afdeling meerdere MDO's op verschillende "
-                "dagen, kies dan alle dagen: op elke MDO-dag werkt dan een psycholoog van de afdeling, iedereen "
-                "op de afdeling is bij minstens één MDO, en het liefst is er een gz-psycholoog bij allemaal.\n"
                 "- **Alleen gz**: alleen gz-psychologen mogen hier werken.\n"
                 "- **Max. medewerkers**: hoeveel verschillende medewerkers er maximaal op deze afdeling mogen (leeg = geen maximum).\n"
                 "- **Afdelingsgroep**: afdelingen met hetzelfde label (bv. *GRZ*) doet een medewerker op één locatie.\n"
@@ -257,7 +258,6 @@ def _tab_afdelingen(tabellen) -> None:
                 + UITLEG_RIJEN
             )
         req = naar_bool(tabellen["Requirements"], ["alleen_gz_psycholoog", "voorrang"])
-        req["mdo_dag"] = req["mdo_dag"].map(lambda w: list(mdo_dagen(w)))  # 'di,do' -> ['di', 'do']
         req = voor_editor(req, ["afdeling", "locatie"])
         with st.form("afdelingen", border=False):
             bewerkt = st.data_editor(
@@ -267,17 +267,12 @@ def _tab_afdelingen(tabellen) -> None:
                 hide_index=True,
                 width="stretch",
                 height="content",
-                column_order=[VERWIJDER, "afdeling", "locatie", "vereiste_uren", "mdo_dag", "alleen_gz_psycholoog", "max_medewerkers", "afdelingsgroep", "voorrang"],
+                column_order=[VERWIJDER, "afdeling", "locatie", "vereiste_uren", "alleen_gz_psycholoog", "max_medewerkers", "afdelingsgroep", "voorrang"],
                 column_config={
                     VERWIJDER: verwijder_kolom(),
                     "afdeling": st.column_config.TextColumn("Afdeling", required=True, pinned=True, width="large"),
                     "locatie": st.column_config.SelectboxColumn("Locatie", options=L, required=True, width="small"),
                     "vereiste_uren": uren_kolom("Uren per week", required=True, width="small"),
-                    "mdo_dag": st.column_config.MultiselectColumn(
-                        "MDO-dag", options=WERKDAGEN, format_func=lambda d: DAG_NAMEN.get(d, d).capitalize(),
-                        help="Dag(en) van het MDO; leeg = geen MDO. Meerdere dagen (bv. twee onderdelen met elk een eigen "
-                        "MDO): op elke MDO-dag moet een psycholoog van de afdeling werken.", width="medium",
-                    ),
                     "alleen_gz_psycholoog": st.column_config.CheckboxColumn("Alleen gz", default=False, width="small"),
                     "max_medewerkers": st.column_config.NumberColumn("Max. medewerkers", min_value=1, step=1, width="small"),
                     "afdelingsgroep": st.column_config.TextColumn("Afdelingsgroep", width="small"),
@@ -289,8 +284,77 @@ def _tab_afdelingen(tabellen) -> None:
             )
             if st.form_submit_button("Opslaan", type="primary", disabled=achtergrond.bezig()):
                 nieuw = naar_int(na_editor(bewerkt), ["alleen_gz_psycholoog", "voorrang"])
-                nieuw["mdo_dag"] = nieuw["mdo_dag"].map(mdo_tekst)  # ['di', 'do'] -> 'di,do'
                 _opslaan(wijzig_vereisten(tabellen, nieuw))
+
+    _ido(tabellen)
+
+
+def _ido(tabellen) -> None:
+    req = tabellen["Requirements"]
+    plekken = {_plek(d, l): (d, l) for d, l in sorted(zip(req["afdeling"], req["locatie"]), key=lambda p: (p[0].lower(), p[1]))}
+    with st.container(border=True):
+        st.subheader("IDO's")
+        st.caption(
+            "Wanneer elke afdeling IDO heeft. Iemand wordt alleen op een afdeling ingepland als die bij minstens één "
+            "IDO van die afdeling kan zijn, en niemand hoeft bij twee IDO's tegelijk te zijn."
+        )
+        with st.expander("Uitleg van de kolommen"):
+            st.markdown(
+                "- **Afdeling**: één rij per IDO. Heeft een afdeling meerdere onderdelen met elk een eigen IDO, "
+                "zet ze dan allemaal op een eigen rij (met de naam bij *Onderdeel*). Onderdelen met dezelfde dag en "
+                "tijd tellen als één IDO.\n"
+                "- **Weken**: elke week, of alleen in even of oneven weken. Een IDO in even weken botst niet met "
+                "een IDO in oneven weken.\n"
+                "- **Van / tot**: de tijd, bv. *12:30* en *15:00*. Leeg = tijd onbekend (dan telt alleen de dag).\n"
+                "- **Samen**: twee afdelingen die samen één IDO hebben, krijgen hier hetzelfde label (bv. "
+                "*Bultweide + Gemeent*). Wie op allebei werkt, kan dan bij die ene IDO zijn.\n\n"
+                "Regels: bij elke IDO is een psycholoog van de afdeling; wie op de afdeling werkt, is bij minstens "
+                "één IDO van die afdeling (uitzondering: afspraak *Hoeft niet bij IDO*); heeft een afdeling meerdere "
+                "IDO's, dan liefst een gz-psycholoog bij allemaal.\n\n"
+                + UITLEG_RIJEN
+            )
+        ido = tabellen["IDO"].copy()
+        ido["plek"] = [_plek(d, l) for d, l in zip(ido["afdeling"], ido["locatie"])]
+        ido["dag"] = ido["dag"].map(lambda w: (mdo_dagen(w) or (None,))[0])
+        ido = voor_editor(ido, ["plek"])
+        with st.form("ido", border=False):
+            bewerkt = st.data_editor(
+                ido,
+                key="editor_ido",
+                num_rows="add",
+                hide_index=True,
+                width="stretch",
+                height="content",
+                column_order=[VERWIJDER, "plek", "onderdeel", "dag", "weken", "van", "tot", "samen"],
+                column_config={
+                    VERWIJDER: verwijder_kolom(),
+                    "plek": st.column_config.SelectboxColumn("Afdeling", options=list(plekken), required=True, pinned=True, width="medium"),
+                    "onderdeel": st.column_config.TextColumn("Onderdeel", width="medium"),
+                    "dag": st.column_config.SelectboxColumn(
+                        "Dag", options=WERKDAGEN, format_func=lambda d: DAG_NAMEN.get(d, d).capitalize(), required=True, width="small",
+                    ),
+                    "weken": st.column_config.SelectboxColumn(
+                        "Weken", options=WEKEN, format_func=WEKEN_LABELS.get, default="elke", required=True, width="small",
+                    ),
+                    "van": st.column_config.TextColumn("Van", help="Bv. 12:30", width="small", validate=TIJD_PATROON),
+                    "tot": st.column_config.TextColumn("Tot", help="Bv. 15:00", width="small", validate=TIJD_PATROON),
+                    "samen": st.column_config.TextColumn("Samen", help="Zelfde label = één gezamenlijke IDO", width="medium"),
+                },
+            )
+            if st.form_submit_button("Opslaan", type="primary", disabled=achtergrond.bezig()):
+                nieuw = na_editor(bewerkt)
+                fouten = []
+                if nieuw["plek"].isna().any() or nieuw["dag"].isna().any():
+                    fouten.append("Elke IDO moet een afdeling en een dag hebben.")
+                for r in nieuw.to_dict("records"):
+                    van, tot = lees_tijd(r["van"]), lees_tijd(r["tot"])
+                    if (van is None) != (tot is None) or (van is not None and van >= tot):
+                        fouten.append(f"{r['plek']}: vul een begin- én eindtijd in (bv. 12:30 en 15:00), begin vóór eind.")
+                nieuw["afdeling"] = nieuw["plek"].map(lambda p: plekken.get(p, (None, None))[0])
+                nieuw["locatie"] = nieuw["plek"].map(lambda p: plekken.get(p, (None, None))[1])
+                nieuw["van"] = nieuw["van"].map(lambda w: tijd_tekst(lees_tijd(w)) or None)
+                nieuw["tot"] = nieuw["tot"].map(lambda w: tijd_tekst(lees_tijd(w)) or None)
+                _opslaan(({**tabellen, "IDO": nieuw[KOLOMMEN["IDO"]]}, ["IDO's opgeslagen"], fouten))
 
 
 # ------------------------------------------------------------------ Huidige planning
@@ -389,7 +453,10 @@ def _tab_huidige_planning(tabellen, inzetbaar: pd.Series) -> None:
 
 
 # Keuzes in de kolom 'Regel', zoals de gebruiker ze ziet.
-REGEL_LABELS = {"minimaal": "Minstens … uur", "precies": "Precies … uur", "uitsluiten": "Werkt hier niet"}
+REGEL_LABELS = {
+    "minimaal": "Minstens … uur", "precies": "Precies … uur", "uitsluiten": "Werkt hier niet",
+    "geen_ido": "Hoeft niet bij IDO",
+}
 
 
 def _groep_label(groep: str) -> str:
@@ -410,7 +477,8 @@ def _werkdruk_basis(tabellen) -> None:
         st.caption(
             "Hoe vol medewerkers liefst worden ingepland, als percentage van hun inzetbare uren. Dit zijn voorkeuren, "
             "geen harde grenzen: als het niet anders kan, wijkt de planning ervan af, zo weinig mogelijk. "
-            "Het maximum voor basispsychologen weegt het zwaarst: dat gaat vóór de andere doelen. "
+            "Het maximum voor basispsychologen en het maximum aantal afdelingen wegen het zwaarst: "
+            "die gaan vóór de andere doelen. "
             f"Basispsycholoog = geen gz en niet in opleiding (nu: {', '.join(basis) if basis else 'niemand'})."
         )
         with st.form("werkdruk_basis", border=False):
@@ -431,13 +499,19 @@ def _werkdruk_basis(tabellen) -> None:
                 "Basispsychologen: maximaal (%)", min_value=50, max_value=100, step=5,
                 value=int(round(p.max_bezetting_basis * 100)),
             )
+            c5, _r1, _r2, _r3 = st.columns(4)
+            max_afd = c5.number_input(
+                "Liefst maximaal … afdelingen per medewerker", min_value=0, max_value=20, step=1,
+                value=int(p.max_afdelingen), help="0 = geen maximum.",
+            )
             if st.form_submit_button("Opslaan", type="primary", disabled=achtergrond.bezig()):
                 if minimaal > maximaal:
                     st.error("Bij niet-gz moet het minimum lager zijn dan het maximum.")
                     st.stop()
                 config = tabellen["Config"].set_index("key")["value"].to_dict()
                 nieuw = {**config, "max_bezetting_basis": str(int(pct)), "streef_bezetting_gz": str(int(gz)),
-                         "min_bezetting_niet_gz": str(int(minimaal)), "max_bezetting_niet_gz": str(int(maximaal))}
+                         "min_bezetting_niet_gz": str(int(minimaal)), "max_bezetting_niet_gz": str(int(maximaal)),
+                         "max_afdelingen": str(int(max_afd))}
                 # Alleen de instellingen wegschrijven; de rest van de invoer blijft onaangeroerd.
                 store.schrijf_tabel("Config", pd.DataFrame({"key": list(nieuw), "value": list(nieuw.values())}))
                 st.session_state["meldingen"] = ["Opgeslagen"]
@@ -465,6 +539,8 @@ def _zin(rij) -> tuple[str, str | None]:
     u = None if _leeg(uren) else nl_getal(float(uren))
     if regel == "uitsluiten":
         return f"**{e}** werkt niet op {plek}", None
+    if regel == "geen_ido":
+        return f"**{e}** hoeft niet bij de IDO van {plek} te zijn (als {e} daar werkt)", None
     if regel == "precies":
         if u is None:
             return f"**{e}** werkt precies … uur op {plek}", "vul het aantal uren in"
@@ -487,7 +563,9 @@ def _afspraken(tabellen) -> None:
             st.markdown(
                 "- **Minstens … uur**: werkt daar minstens zoveel uur. Uren leeg = moet er werken, aantal maakt niet uit.\n"
                 "- **Precies … uur**: werkt daar precies zoveel uur.\n"
-                "- **Werkt hier niet**: wordt daar nooit ingepland.\n\n"
+                "- **Werkt hier niet**: wordt daar nooit ingepland.\n"
+                "- **Hoeft niet bij IDO**: mag daar werken zonder bij de IDO te zijn (bv. omdat die niet op de "
+                "IDO-dag werkt). Combineer met *Minstens … uur* als iemand er ook echt moet werken.\n\n"
                 "**Waar** vul je in met Locatie en Afdeling:\n"
                 "- alleen een **afdeling**: die afdeling, op welke locatie ook;\n"
                 "- alleen een **locatie**: de hele locatie, alle afdelingen daar;\n"
@@ -516,7 +594,7 @@ def _afspraken(tabellen) -> None:
                 "regel": st.column_config.SelectboxColumn(
                     "Regel", options=REGELS, format_func=REGEL_LABELS.get, required=True, default="minimaal",
                 ),
-                "uren": uren_kolom("Uren", help="Bij 'minstens': leeg = moet er werken. Bij 'precies': verplicht. Bij 'werkt hier niet': leeg."),
+                "uren": uren_kolom("Uren", help="Bij 'minstens': leeg = moet er werken. Bij 'precies': verplicht. Bij 'werkt hier niet' en 'hoeft niet bij IDO': leeg."),
                 "locatie": st.column_config.SelectboxColumn("Locatie", options=L, help="Leeg = op alle locaties"),
                 "waar": st.column_config.SelectboxColumn(
                     "Afdeling  (leeg = hele locatie)", options=[*D, *groep_van], width="large",
@@ -529,7 +607,7 @@ def _afspraken(tabellen) -> None:
         waar = nieuw.pop("waar")
         nieuw["afdeling"] = waar.map(lambda w: None if _leeg(w) or w in groep_van else w)
         nieuw["afdelingsgroep"] = waar.map(lambda w: groep_van.get(w) if isinstance(w, str) else None)
-        nieuw.loc[nieuw["regel"] == "uitsluiten", "uren"] = None
+        nieuw.loc[nieuw["regel"].isin(["uitsluiten", "geen_ido"]), "uren"] = None
         nieuw = nieuw[KOLOMMEN["Afspraken"]]
 
         st.markdown("**Zo begrijpt de planning je afspraken**")

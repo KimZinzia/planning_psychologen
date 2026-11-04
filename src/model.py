@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 
 import pulp
 
-from data import Params, is_basispsycholoog
+from data import Params, ido_overlapt, is_basispsycholoog
 
 # Minimaal aantal uren van een toewijzing (één medewerker op één afdeling op
 # één locatie): wie ergens werkt, werkt daar minstens zoveel uur. Ook gebruikt
@@ -38,7 +38,7 @@ CONSTRAINT_GROEPEN = {
     "afdelingsgroep": "Afdelingsgroep op één locatie",
     "afspraken": "Afspraken per medewerker (minimaal, precies, uitsluiten)",
     "minimum_toewijzing": "Minimaal 1 uur per toewijzing",
-    "mdo": "Aanwezig bij de MDO's van de afdeling",
+    "mdo": "Aanwezig bij de IDO's van de afdeling (niet twee tegelijk)",
     "nooit_samen": "Locaties die nooit gecombineerd mogen worden",
 }
 
@@ -56,13 +56,19 @@ class Variabelen:
     # is geen gz-psycholoog die bij álle MDO's kan zijn. Gevuld door add_mdo_constraints.
     mdo_zonder_gz: dict = field(default_factory=dict)
     mdo_gz_geschikt: dict = field(default_factory=dict)
+    # ido[e,d,l,k] binair: e is bij IDO nummer k van afdeling d op locatie l (zie add_mdo_constraints)
+    ido: dict = field(default_factory=dict)
+    # ido_gz_alle[e,d,l] binair: gz-psycholoog e is bij alle IDO's van d op l
+    ido_gz_alle: dict = field(default_factory=dict)
     # werkt[e,d,l] binair, alleen voor afdelingen op meerdere locaties (zie add_minimum_toewijzing_constraints)
     werkt: dict = field(default_factory=dict)
     # boven_max[e] >= 0: uren dat basispsycholoog e boven de maximale bezetting zit (zie add_basis_constraints)
     boven_max: dict = field(default_factory=dict)
     # tekort[d,l] >= 0: uren die afdeling d op locatie l tekortkomt (zie add_coverage_constraints)
     tekort: dict = field(default_factory=dict)
-    tekort_half: dict = field(default_factory=dict)  # alleen bij een tekort: tekort = 0,5 * tekort_half (zie solve._dek_zorg)  # [d,l] -> gz-psychologen die op alle MDO-dagen werken
+    tekort_half: dict = field(default_factory=dict)  # alleen bij een tekort: tekort = 0,5 * tekort_half (zie solve._dek_zorg)
+    # teveel_afd[e] >= 0: aantal afdelingen dat e boven p.max_afdelingen zit (zie solve._werkdruk)
+    teveel_afd: dict = field(default_factory=dict)
 
 
 def get_dl_pairs(p: Params) -> list[tuple[str, str]]:
@@ -377,50 +383,93 @@ def add_afspraken_constraints(model, p: Params, v: Variabelen):
             model += totaal == uren
         elif regel == "uitsluiten":
             model += totaal == 0
+        elif regel == "geen_ido":
+            continue  # geldt bij de IDO's, zie add_mdo_constraints
         else:
             raise ValueError(f"Onbekende regel in afspraken: {regel!r}")
 
 
-def add_mdo_constraints(model, p: Params, v: Variabelen):
-    """Constraint 11 (optioneel): MDO's. Per afdeling met MDO-dag(en):
+def _geen_ido(p: Params, v: Variabelen) -> set[tuple[str, str, str]]:
+    """(e, d, l) waarvoor een afspraak 'geen_ido' geldt: e hoeft daar niet bij de IDO."""
+    vrij = set()
+    for (e, d, groep, l, regel, _uren) in p.afspraken:
+        if regel == "geen_ido":
+            vrij |= {(e, dep, loc) for (dep, loc) in _min_uren_target_dl(p, v.dl_pairs, d, groep, l)}
+    return vrij
 
-    a. Wie op de afdeling werkt, werkt op minstens één van de MDO-dagen.
-       Bij één MDO-dag betekent dat: op die dag. Wie op geen van de dagen
-       werkt, kan er dus niet ingepland worden: x[e,d,l] = 0.
-    b. Bij meerdere MDO-dagen: op élke MDO-dag werkt minstens één
-       psycholoog van die afdeling (met uren daar). Werkt er maar één, dan
-       moet die dus op alle MDO-dagen werken.
-    c. Voorkeur (geen eis): liefst een gz-psycholoog die bij álle MDO's van
-       de afdeling kan zijn. mdo_zonder_gz[d,l] = 1 als dat niet lukt; het
-       aantal daarvan wordt in solve.py zo klein mogelijk gemaakt.
+
+def add_mdo_constraints(model, p: Params, v: Variabelen):
+    """Constraint 11 (optioneel): IDO's (in de code nog 'mdo'). Per afdeling
+    met IDO's (p.ido: dag, weken, van, tot). ido[e,d,l,k] = 1: e is bij IDO k
+    van afdeling d op locatie l. Dat kan alleen als e op die dag werkt en daar
+    uren heeft.
+
+    a. Wie op de afdeling werkt, is bij minstens één IDO van die afdeling.
+       Wie op geen enkele IDO-dag werkt, kan er dus niet ingepland worden.
+       Uitzondering: een afspraak 'geen_ido' (e hoeft niet bij de IDO).
+    b. Bij elke IDO is minstens één psycholoog van de afdeling.
+    c. Niemand is bij twee IDO's tegelijk: zelfde dag, weken die samenvallen
+       (elke week valt samen met even en oneven) en tijden die overlappen.
+    d. Voorkeur (geen eis): bij afdelingen met meerdere IDO's liefst een
+       gz-psycholoog die bij álle IDO's is. mdo_zonder_gz[d,l] = 1 als dat
+       niet lukt; het aantal daarvan wordt in solve.py zo klein mogelijk gemaakt.
 
     Medewerkers zonder ingevulde werkdagen gelden als 'onbekend' en worden
-    niet beperkt (ze tellen overal als aanwezig). Afdelingen zonder MDO-dag
-    ook niet.
+    niet beperkt door de dag. Afdelingen zonder IDO ook niet.
     """
-    for (d, l), mdo in p.mdo_dag.items():
+    vrij = _geen_ido(p, v)
+    ie = {e: i for i, e in enumerate(p.E)}
+    alle_slots = []  # (d, l, k, slot)
+    for n, ((d, l), slots) in enumerate(p.ido.items()):
         if (d, l) not in v.dl_pairs or p.req[d, l] <= 0:
-            continue  # bv. tijdelijk 0 uur (noodplanning): dan ook geen MDO-eisen
-        mdo = set(mdo)
-
-        def aanwezig(e, dagen):
+            continue  # bv. tijdelijk 0 uur (noodplanning): dan ook geen IDO-eisen
+        bij = {}
+        for e in p.E:
             werk = p.werkdagen.get(e, set())
-            return not werk or dagen <= werk
-
-        for e in p.E:  # a
-            werk = p.werkdagen.get(e, set())
-            if werk and not (mdo & werk):
+            for k, slot in enumerate(slots):
+                if not werk or slot[0] in werk:
+                    var = model.add_variable(f"ido_{ie[e]}_{n}_{k}", cat="Binary")
+                    v.ido[e, d, l, k] = var
+                    bij[e, k] = var
+                    model += MINIMUM_AANWEZIGHEID * var <= v.x[e, d, l]
+            eigen = [bij[e, k] for k in range(len(slots)) if (e, k) in bij]
+            if (e, d, l) in vrij:
+                continue
+            if not eigen:  # a: kan bij geen enkele IDO zijn
                 model += v.x[e, d, l] == 0
-        if len(mdo) < 2:
+                continue
+            werkt = v.werkt.get((e, d, l), v.y[e, d])
+            model += werkt <= pulp.lpSum(eigen)  # a
+        for k, slot in enumerate(slots):  # b
+            model += pulp.lpSum(bij[e, k] for e in p.E if (e, k) in bij) >= 1
+            alle_slots.append((d, l, k, slot))
+        if len(slots) < 2:
             continue
-        for dag in mdo:  # b
-            model += pulp.lpSum(v.x[e, d, l] for e in p.E if aanwezig(e, {dag})) >= MINIMUM_AANWEZIGHEID
-        # c: gz-psycholoog die op alle MDO-dagen werkt
-        geschikt = [e for e in p.E if p.gz.get(e, 0) == 1 and aanwezig(e, mdo)]
+        # d: gz-psycholoog die bij alle IDO's is
+        geschikt = [e for e in p.E if p.gz.get(e, 0) == 1 and all((e, k) in bij for k in range(len(slots)))]
         straf = model.add_variable(f"mdo_zonder_gz_{len(v.mdo_zonder_gz)}", cat="Binary")
         v.mdo_zonder_gz[d, l] = straf
         v.mdo_gz_geschikt[d, l] = geschikt
-        model += pulp.lpSum(v.x[e, d, l] for e in geschikt) >= MINIMUM_AANWEZIGHEID * (1 - straf)
+        alles = []
+        for e in geschikt:
+            g = model.add_variable(f"ido_gz_alle_{ie[e]}_{n}", cat="Binary")
+            v.ido_gz_alle[e, d, l] = g
+            alles.append(g)
+            for k in range(len(slots)):
+                model += g <= bij[e, k]
+        model += pulp.lpSum(alles) >= 1 - straf
+
+    # c: niet bij twee IDO's tegelijk. Per medewerker, per paar IDO's dat botst
+    # (zie data.ido_overlapt; een gezamenlijk overleg botst niet).
+    botsend = [
+        (i, j) for i in range(len(alle_slots)) for j in range(i + 1, len(alle_slots))
+        if ido_overlapt(alle_slots[i][3], alle_slots[j][3])
+    ]
+    for e in p.E:
+        for i, j in botsend:
+            (d1, l1, k1, _), (d2, l2, k2, _) = alle_slots[i], alle_slots[j]
+            if (e, d1, l1, k1) in v.ido and (e, d2, l2, k2) in v.ido:
+                model += v.ido[e, d1, l1, k1] + v.ido[e, d2, l2, k2] <= 1
 
 
 def add_nooit_samen_constraints(model, p: Params, v: Variabelen):

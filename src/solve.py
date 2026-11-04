@@ -1,11 +1,12 @@
 """Lost het model lexicografisch op. Allereerst: zo veel mogelijk zorg dekken
 (bij te weinig formatie zo min mogelijk tekort, eerlijk verdeeld, afdelingen
 met voorrang zo min mogelijk gekort). Dan: basispsychologen liefst niet boven
-hun maximale bezetting (zie model.add_basis_constraints). Daarna vier doelen:
+hun maximale bezetting (zie model.add_basis_constraints) en niemand liefst op
+meer dan p.max_afdelingen afdelingen. Daarna vier doelen:
 1. zo min mogelijk wijzigingen ten opzichte van de huidige planning én zo
    weinig mogelijk reizigers (even belangrijk, zie REIS_GEWICHT);
-2. bij afdelingen met meerdere MDO-dagen: liefst een gz-psycholoog die bij
-   alle MDO's is (zie model.add_mdo_constraints);
+2. bij afdelingen met meerdere IDO-dagen: liefst een gz-psycholoog die bij
+   alle IDO's is (zie model.add_mdo_constraints);
 3. de uren eerlijk verdelen: niet-gz liefst tussen hun minimum en maximum, gz rond hun
    streefwaarde, binnen elke groep zo gelijk mogelijk (in halve uren);
 4. tot slot zo min mogelijk medewerkers per afdeling.
@@ -20,7 +21,7 @@ from dataclasses import dataclass
 import pandas as pd
 import pulp
 
-from data import Params
+from data import Params, ido_tekst
 from model import CONSTRAINT_GROEPEN, Variabelen, build_model
 
 TIJDSLIMIET_PER_STAP = 300  # seconden; meer tijd = grotere kans op het allerbeste rooster
@@ -30,9 +31,9 @@ TIJDSLIMIET_PER_STAP = 300  # seconden; meer tijd = grotere kans op het allerbes
 STAPPEN = [
     "Controleren of een planning mogelijk is",
     "Zo veel mogelijk zorg dekken",
-    "Basispsychologen niet te vol",
+    "Werkdruk: niet te vol, niet te veel afdelingen",
     "Zo min mogelijk wijzigingen en reizen",
-    "Gz-psycholoog bij alle MDO's",
+    "Gz-psycholoog bij alle IDO's",
     "Uren eerlijk verdelen",
     "Zo min mogelijk medewerkers per afdeling",
 ]
@@ -132,9 +133,16 @@ def _ruim_op(p: Params, v: Variabelen, tol: float = 1e-6) -> None:
         var.setInitialValue(max(0.0, uren - p.max_bezetting_basis * p.avail[e]))
     for (e, d, l), var in v.werkt.items():
         var.setInitialValue(1 if (v.x[e, d, l].value() or 0) > tol else 0)
+    # IDO-aanwezigheid: de waarden van de solver kloppen nog (de uren veranderen
+    # hier niet), alleen afronden.
+    for var in [*v.ido.values(), *v.ido_gz_alle.values()]:
+        var.setInitialValue(round(var.value() or 0))
     for (d, l), var in v.mdo_zonder_gz.items():
-        aanwezig = any((v.x[e, d, l].value() or 0) > tol for e in v.mdo_gz_geschikt[d, l])
+        aanwezig = any(round(v.ido_gz_alle[e, d, l].value() or 0) == 1 for e in v.mdo_gz_geschikt[d, l])
         var.setInitialValue(0 if aanwezig else 1)
+    for e, var in v.teveel_afd.items():
+        aantal = len({d for (e2, d) in werkt_afd if e2 == e})
+        var.setInitialValue(max(0, aantal - p.max_afdelingen))
 
 
 def _som(variabelen) -> int:
@@ -147,18 +155,9 @@ def solve_lexicographic(
     niet_bewezen: list[str] = []
     tekort = _dek_zorg(model, p, v, msg, niet_bewezen, voortgang)
 
-    # --- Dan: basispsychologen liefst niet boven hun maximale bezetting ---
-    boven_max: dict[str, float] = {}
-    if v.boven_max:
-        _ruim_op(p, v)
-        overschrijding = pulp.lpSum(v.boven_max.values())
-        model.setObjective(overschrijding)
-        voortgang(3, STAPPEN[2])
-        _los_op(model, "basispsychologen niet te vol", msg, niet_bewezen, gap=0.49)
-        _ruim_op(p, v)
-        waarde = pulp.value(overschrijding)
-        model += overschrijding <= waarde + 0.01, "fix_basis"
-        boven_max = {e: round(var.value() or 0, 1) for e, var in v.boven_max.items() if (var.value() or 0) > 0.05}
+    # --- Dan: werkdruk (basispsychologen niet te vol, niet te veel afdelingen) ---
+    voortgang(3, STAPPEN[2])
+    boven_max, teveel_afd = _werkdruk(model, p, v, msg, niet_bewezen)
 
     # --- Doel 1: wijzigingen en reizigers (op zowel l1 als l2), even belangrijk ---
     afwijking = pulp.lpSum(v.z[e, d, l] for e in p.E for (d, l) in v.dl_pairs)
@@ -171,13 +170,13 @@ def solve_lexicographic(
     z_star, w_star = _som(v.z.values()), _som(v.w.values())
     model += doel1 <= z_star + REIS_GEWICHT * w_star, "fix_doel1"
 
-    # --- Doel 2: liefst een gz-psycholoog bij alle MDO's (alleen afdelingen met meerdere MDO-dagen) ---
+    # --- Doel 2: liefst een gz-psycholoog bij alle IDO's (alleen afdelingen met meerdere IDO-dagen) ---
     zonder_gz = 0
     if v.mdo_zonder_gz:
         mdo_doel = pulp.lpSum(v.mdo_zonder_gz.values())
         model.setObjective(mdo_doel)
         voortgang(5, STAPPEN[4])
-        _los_op(model, "gz bij MDO's", msg, niet_bewezen)
+        _los_op(model, "gz bij IDO's", msg, niet_bewezen)
         _ruim_op(p, v)
         zonder_gz = _som(v.mdo_zonder_gz.values())
         model += mdo_doel <= zonder_gz, "fix_mdo_gz"
@@ -205,6 +204,8 @@ def solve_lexicographic(
             f"{d} ({l})" for (d, l), var in v.mdo_zonder_gz.items() if round(var.value() or 0) == 1
         ) if zonder_gz else [],
         "boven_max_basis": boven_max,
+        "teveel_afdelingen": teveel_afd,
+        "ido": ido_aanwezig(p, v),
         "tekort": tekort,
         "niet_bewezen_optimaal": niet_bewezen,
     }
@@ -262,6 +263,42 @@ def _dek_zorg(
     return {
         f"{d} ({l})": round(var.value() or 0, 1) for (d, l), var in v.tekort.items() if (var.value() or 0) > 0.05
     }
+
+
+def _werkdruk(
+    model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool, niet_bewezen: list[str]
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Na het dekken van de zorg, vóór doel 1 (sterke voorkeuren):
+    a. basispsychologen liefst niet boven hun maximale bezetting
+       (zie model.add_basis_constraints);
+    b. niemand liefst op meer dan p.max_afdelingen afdelingen (0 = geen maximum).
+    Geeft terug: uren boven het maximum per basispsycholoog, en het aantal
+    afdelingen boven het maximum per medewerker."""
+    boven_max: dict[str, float] = {}
+    if v.boven_max:
+        _ruim_op(p, v)
+        overschrijding = pulp.lpSum(v.boven_max.values())
+        model.setObjective(overschrijding)
+        _los_op(model, "basispsychologen niet te vol", msg, niet_bewezen, gap=0.49)
+        _ruim_op(p, v)
+        waarde = pulp.value(overschrijding)
+        model += overschrijding <= waarde + 0.01, "fix_basis"
+        boven_max = {e: round(var.value() or 0, 1) for e, var in v.boven_max.items() if (var.value() or 0) > 0.05}
+
+    teveel_afd: dict[str, int] = {}
+    if p.max_afdelingen > 0 and len(p.D) > p.max_afdelingen:
+        for i, e in enumerate(p.E):
+            t_e = model.add_variable(f"teveel_afd_{i}", lowBound=0)
+            v.teveel_afd[e] = t_e
+            model += pulp.lpSum(v.y[e, d] for d in p.D) - p.max_afdelingen <= t_e
+        _ruim_op(p, v)
+        som = pulp.lpSum(v.teveel_afd.values())
+        model.setObjective(som)
+        _los_op(model, "niet te veel afdelingen", msg, niet_bewezen)
+        _ruim_op(p, v)
+        model += som <= _som(v.teveel_afd.values()), "fix_max_afdelingen"
+        teveel_afd = {e: round(var.value() or 0) for e, var in v.teveel_afd.items() if round(var.value() or 0) > 0}
+    return boven_max, teveel_afd
 
 
 def _verdeel_gelijk(model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool, niet_bewezen: list[str]) -> None:
@@ -356,6 +393,15 @@ def _verdeel_gelijk(model: pulp.LpProblem, p: Params, v: Variabelen, msg: bool, 
         for k, var in v.x.items():
             var.varValue = vorige[k]
         niet_bewezen.append("gelijke verdeling")
+
+
+def ido_aanwezig(p: Params, v: Variabelen) -> list[dict]:
+    """Wie bij welke IDO is: [{medewerker, afdeling, locatie, ido}], ido als tekst."""
+    return [
+        {"medewerker": e, "afdeling": d, "locatie": l, "ido": ido_tekst(p.ido[d, l][k])}
+        for (e, d, l, k), var in v.ido.items()
+        if round(var.value() or 0) == 1
+    ]
 
 
 def bezetting_per_medewerker(p: Params, rooster: pd.DataFrame) -> pd.DataFrame:

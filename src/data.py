@@ -74,16 +74,18 @@ MAX_BEZETTING_BASIS = 0.85
 STREEF_BEZETTING_GZ = 0.90
 MIN_BEZETTING_NIET_GZ = 0.75
 MAX_BEZETTING_NIET_GZ = 0.85
+# Liefst niet meer afdelingen per medewerker dan dit (sterke voorkeur, geen
+# harde grens; 0 = geen maximum). In te stellen in de app (Config).
+MAX_AFDELINGEN = 5
 
 # Werkdagen van een medewerker. Het model plant per week, maar gebruikt de
-# werkdagen voor de MDO's: wie op een afdeling werkt, moet werken op de dag
-# van het MDO van die afdeling (Requirements.mdo_dag, constraint 11). Een
-# afdeling kan meerdere MDO-dagen hebben (bv. 'di,do'), zie model.py.
+# werkdagen voor de IDO's: wie op een afdeling werkt, is bij minstens één IDO
+# van die afdeling en werkt dus op die dag (tabel IDO, zie model.add_mdo_constraints).
 WERKDAGEN = ["ma", "di", "wo", "do", "vr"]
 DAG_NAMEN = {"ma": "maandag", "di": "dinsdag", "wo": "woensdag", "do": "donderdag", "vr": "vrijdag"}
 
 TABELLEN = [
-    "Employees", "Locaties", "Requirements", "CurrentSchedule", "Afspraken", "Config",
+    "Employees", "Locaties", "Requirements", "IDO", "CurrentSchedule", "Afspraken", "Config",
     # Noodplanning: tijdelijke aanpassingen met een einddatum (zie pas_tijdelijk_toe)
     "TijdelijkAfdeling", "TijdelijkMedewerker", "TijdelijkRegels",
 ]
@@ -93,7 +95,11 @@ OUDE_TABELLEN = ["MinimumUren", "Bijsturing"]
 KOLOMMEN = {
     "Employees": ["medewerker", "gz_psycholoog", "In opleiding", "Contracturen", *AFTREK_KOLOMMEN, "zwangerschapsverlof", *WERKDAGEN],
     "Locaties": ["locatie"],
-    "Requirements": ["locatie", "afdeling", "vereiste_uren", "alleen_gz_psycholoog", "max_medewerkers", "afdelingsgroep", "mdo_dag", "voorrang"],
+    "Requirements": ["locatie", "afdeling", "vereiste_uren", "alleen_gz_psycholoog", "max_medewerkers", "afdelingsgroep", "voorrang"],
+    # Eén rij per IDO: dag, welke weken (elke / even / oneven) en tijd ('12:30').
+    # 'samen': IDO's met hetzelfde label zijn één gezamenlijk overleg (bv. twee
+    # afdelingen die samen IDO hebben); die botsen dus niet met elkaar.
+    "IDO": ["afdeling", "locatie", "onderdeel", "dag", "weken", "van", "tot", "samen"],
     "CurrentSchedule": ["medewerker", "afdeling", "locatie", "huidige_uren"],
     "Afspraken": ["medewerker", "afdeling", "afdelingsgroep", "locatie", "regel", "uren"],
     "Config": ["key", "value"],
@@ -112,10 +118,18 @@ LOSLAATBARE_REGELS = {
 # - minimaal:   e werkt daar minstens 'uren' uur (leeg = moet er werken, aantal maakt niet uit);
 # - precies:    e werkt daar precies 'uren' uur;
 # - uitsluiten: e werkt daar niet.
-REGELS = ["minimaal", "precies", "uitsluiten"]
+# - geen_ido:   e werkt daar wel, maar hoeft niet bij de IDO te zijn
+#               (bv. omdat e niet op de IDO-dag werkt).
+REGELS = ["minimaal", "precies", "uitsluiten", "geen_ido"]
 
 # Kolommen die tekst bevatten (namen, labels, dagen); de rest is numeriek.
-TEKST_KOLOMMEN = {"medewerker", "afdeling", "locatie", "afdelingsgroep", "mdo_dag", "regel", "key", "value", "tot", "notitie"}
+TEKST_KOLOMMEN = {
+    "medewerker", "afdeling", "locatie", "afdelingsgroep", "mdo_dag", "regel", "key", "value", "tot", "notitie",
+    "onderdeel", "dag", "weken", "van", "samen",
+}
+
+# Weken waarin een IDO is: elke week, of om de week (even of oneven weeknummers).
+WEKEN = ["elke", "even", "oneven"]
 
 
 @dataclass
@@ -137,7 +151,12 @@ class Params:
     afspraken: list[tuple[str, str | None, str | None, str | None, str, float | None]] = field(default_factory=list)
     # werkdagen[e]: dagen waarop e werkt; leeg = onbekend (geen beperking)
     werkdagen: dict[str, set[str]] = field(default_factory=dict)
-    # mdo_dag[d, l]: dag(en) van het MDO van afdeling d op locatie l, bv. ('di', 'do'); ontbreekt = geen MDO
+    # ido[d, l]: de IDO's van afdeling d op locatie l, elk als (dag, weken, van,
+    # tot, samen) met van/tot in minuten na middernacht (None = tijd onbekend) en
+    # samen = label van een gezamenlijk overleg of None. Dubbele (zelfde dag,
+    # weken en tijd, bv. twee onderdelen samen) staan er één keer in.
+    ido: dict[tuple[str, str], tuple[tuple, ...]] = field(default_factory=dict)
+    # mdo_dag[d, l]: de dag(en) van die IDO's, bv. ('di', 'do'); ontbreekt = geen IDO
     mdo_dag: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
     # Locatieparen die één medewerker nooit mag combineren (harde eis), bv. ONO en RK
     nooit_samen: list[tuple[str, str]] = field(default_factory=list)
@@ -148,6 +167,8 @@ class Params:
     streef_bezetting_gz: float = STREEF_BEZETTING_GZ
     min_bezetting_niet_gz: float = MIN_BEZETTING_NIET_GZ
     max_bezetting_niet_gz: float = MAX_BEZETTING_NIET_GZ
+    # Liefst niet meer afdelingen per medewerker dan dit; 0 = geen maximum
+    max_afdelingen: int = MAX_AFDELINGEN
     # voorrang[d, l] = 1: bij een tekort aan uren zo min mogelijk korten
     voorrang: dict[tuple[str, str], int] = field(default_factory=dict)
     # Vereiste uren zonder tijdelijke aanpassingen (alleen voor weergave)
@@ -219,11 +240,83 @@ def oude_naar_afspraken(minimum: pd.DataFrame | None, bijsturing: pd.DataFrame |
     return pd.DataFrame(rijen, columns=KOLOMMEN["Afspraken"])
 
 
+def mdo_dag_naar_ido(requirements: pd.DataFrame) -> pd.DataFrame:
+    """Oude kolom Requirements.mdo_dag ('di,do') -> tabel IDO: per dag één IDO,
+    elke week, tijd onbekend."""
+    rijen = [
+        {"afdeling": r["afdeling"], "locatie": r["locatie"], "onderdeel": None, "dag": dag, "weken": "elke",
+         "van": None, "tot": None, "samen": None}
+        for r in requirements.to_dict("records")
+        for dag in mdo_dagen(r.get("mdo_dag"))
+    ]
+    return pd.DataFrame(rijen, columns=KOLOMMEN["IDO"])
+
+
+def lees_tijd(waarde) -> int | None:
+    """'12:30' / '12.30' / '9:00' / '9' -> minuten na middernacht; anders None."""
+    if _leeg_naar_none(waarde) is None:
+        return None
+    m = re.fullmatch(r"\s*(\d{1,2})(?:[:.](\d{2}))?\s*(?:uur)?\s*", str(waarde))
+    if not m:
+        return None
+    uur, minuut = int(m.group(1)), int(m.group(2) or 0)
+    return uur * 60 + minuut if uur < 24 and minuut < 60 else None
+
+
+def tijd_tekst(minuten: int | None) -> str:
+    return "" if minuten is None else f"{minuten // 60:02d}:{minuten % 60:02d}"
+
+
+def _weken(waarde) -> str:
+    """'Oneven weken' / 'oneven' -> 'oneven'; leeg of onbekend -> 'elke'."""
+    tekst = str(_leeg_naar_none(waarde) or "").lower()
+    return "oneven" if "oneven" in tekst else "even" if "even" in tekst else "elke"
+
+
+def _ido(tabel: pd.DataFrame) -> dict[tuple[str, str], tuple[tuple, ...]]:
+    volgorde = {d: i for i, d in enumerate(WERKDAGEN)}
+    result: dict[tuple[str, str], list] = {}
+    for r in tabel.to_dict("records"):
+        dag = mdo_dagen(r["dag"])
+        if not dag:
+            continue
+        slot = (dag[0], _weken(r["weken"]), lees_tijd(r["van"]), lees_tijd(r["tot"]), _leeg_naar_none(r["samen"]))
+        lijst = result.setdefault((r["afdeling"], r["locatie"]), [])
+        if not any(s[:4] == slot[:4] for s in lijst):  # twee onderdelen tegelijk = één IDO
+            lijst.append(slot)
+    return {
+        dl: tuple(sorted(s, key=lambda x: (volgorde.get(x[0], 99), x[1], x[2] or 0))) for dl, s in result.items()
+    }
+
+
+def ido_overlapt(a: tuple, b: tuple) -> bool:
+    """Botsen twee IDO's (dag, weken, van, tot, samen)? Alleen als de dag gelijk
+    is, de weken samenvallen (elke week valt samen met even en oneven) en de
+    tijden overlappen, en ze geen gezamenlijk overleg zijn (zelfde label
+    'samen'). Zonder tijd: geen botsing bekend."""
+    if a[4] is not None and a[4] == b[4]:
+        return False
+    if a[0] != b[0] or {a[1], b[1]} == {"even", "oneven"}:
+        return False
+    if None in (a[2], a[3], b[2], b[3]):
+        return False
+    return a[2] < b[3] and b[2] < a[3]
+
+
+def ido_tekst(slot: tuple) -> str:
+    """('di', 'oneven', 630, 720, None) -> 'dinsdag oneven weken 10:30-12:00'."""
+    dag, weken, van, tot = slot[:4]
+    tekst = DAG_NAMEN.get(dag, dag) + ("" if weken == "elke" else f" {weken} weken")
+    return tekst + (f" {tijd_tekst(van)}-{tijd_tekst(tot)}" if van is not None and tot is not None else "")
+
+
 def normaliseer_tabellen(tabellen: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
     """Zorgt dat elke tabel bestaat en alle verwachte kolommen heeft (lege
     optionele kolommen worden aangevuld), en verwijdert lege rijen."""
     if tabellen.get("Afspraken") is None and any(tabellen.get(n) is not None for n in OUDE_TABELLEN):
         tabellen = {**tabellen, "Afspraken": oude_naar_afspraken(tabellen.get("MinimumUren"), tabellen.get("Bijsturing"))}
+    if tabellen.get("IDO") is None and tabellen.get("Requirements") is not None and "mdo_dag" in tabellen["Requirements"]:
+        tabellen = {**tabellen, "IDO": mdo_dag_naar_ido(tabellen["Requirements"])}
     result = {}
     for naam in TABELLEN:
         df = tabellen.get(naam)
@@ -315,6 +408,7 @@ def _params_zonder_tijdelijk(tabellen: dict[str, pd.DataFrame]) -> Params:
         )
         for row in t["Afspraken"].itertuples()
     ]
+    ido = {dl: slots for dl, slots in _ido(t["IDO"]).items() if dl in req}
 
     return Params(
         E=E,
@@ -334,17 +428,15 @@ def _params_zonder_tijdelijk(tabellen: dict[str, pd.DataFrame]) -> Params:
             str(row.medewerker): {d for d in WERKDAGEN if pd.to_numeric(getattr(row, d), errors="coerce") == 1}
             for row in employees.itertuples()
         },
-        mdo_dag={
-            (row.afdeling, row.locatie): mdo_dagen(row.mdo_dag)
-            for row in requirements.itertuples()
-            if mdo_dagen(row.mdo_dag)
-        },
+        ido=ido,
+        mdo_dag={dl: mdo_dagen([s[0] for s in slots]) for dl, slots in ido.items()},
         nooit_samen=_nooit_samen(config),
         in_opleiding=dict(zip(E, pd.to_numeric(employees["In opleiding"], errors="coerce").fillna(0).astype(int))),
         max_bezetting_basis=_percentage(config, "max_bezetting_basis", MAX_BEZETTING_BASIS),
         streef_bezetting_gz=_percentage(config, "streef_bezetting_gz", STREEF_BEZETTING_GZ),
         min_bezetting_niet_gz=_percentage(config, "min_bezetting_niet_gz", MIN_BEZETTING_NIET_GZ),
         max_bezetting_niet_gz=_percentage(config, "max_bezetting_niet_gz", MAX_BEZETTING_NIET_GZ),
+        max_afdelingen=_geheel_getal(config, "max_afdelingen", MAX_AFDELINGEN),
         voorrang={
             (row.afdeling, row.locatie): 1
             for row in requirements.itertuples()
@@ -445,6 +537,12 @@ def _percentage(config, sleutel: str, standaard: float) -> float:
     return standaard if pd.isna(waarde) else float(waarde) / 100
 
 
+def _geheel_getal(config, sleutel: str, standaard: int) -> int:
+    """Config-getal (bv. '5') -> 5; leeg of onleesbaar = standaard."""
+    waarde = pd.to_numeric(config.get(sleutel), errors="coerce")
+    return standaard if pd.isna(waarde) else max(int(waarde), 0)
+
+
 def is_basispsycholoog(p: "Params", e: str) -> bool:
     """Geen gz-psycholoog en niet in opleiding."""
     return p.gz.get(e, 0) != 1 and p.in_opleiding.get(e, 0) != 1
@@ -490,7 +588,7 @@ def valideer(p: Params) -> list[str]:
     for (d, l), dagen in p.mdo_dag.items():
         for dag in dagen:
             if dag not in WERKDAGEN:
-                fouten.append(f"Afdeling {d} ({l}): MDO-dag '{dag}' is geen werkdag (ma, di, wo, do of vr).")
+                fouten.append(f"Afdeling {d} ({l}): IDO-dag '{dag}' is geen werkdag (ma, di, wo, do of vr).")
     for (e, d, groep, l, regel, uren) in p.afspraken:
         if e not in E:
             fouten.append(f"Afspraken: medewerker '{e}' bestaat niet.")

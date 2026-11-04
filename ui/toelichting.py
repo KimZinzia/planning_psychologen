@@ -11,6 +11,7 @@ import streamlit as st
 import store
 from data import (
     MAX_BEZETTING_BASIS,
+    MAX_AFDELINGEN,
     MAX_BEZETTING_NIET_GZ,
     MIN_BEZETTING_NIET_GZ,
     PIOG_PRODUCTIVITEIT,
@@ -59,6 +60,7 @@ def _kaart(nummer: int, titel: str, tekst: str, voorbeeld: str) -> None:
 def pagina_toelichting() -> None:
     liever, nooit = _reisregels()
     max_basis = _max_basis()
+    max_afd = params_from_tables(store.lees_tabellen()).max_afdelingen if store.heeft_gegevens() else MAX_AFDELINGEN
     streef_gz, min_niet_gz, max_niet_gz = _werkdruk()
     piog = round(PIOG_PRODUCTIVITEIT * 100)
     minuten = TIJDSLIMIET_PER_STAP // 60
@@ -97,13 +99,15 @@ def pagina_toelichting() -> None:
         )
         st.caption("Voorrang instellen bij Invoer → Afdelingen. Zelf tijdelijk bijsturen kan op de pagina Noodplanning.")
     with vooraf_rechts.container(border=True, key="kaart_toel_basis"):
-        st.markdown("#### Daarna: basispsychologen niet te vol")
+        st.markdown("#### Daarna: werkdruk")
         st.markdown(
             f"Een basispsycholoog (geen gz, niet in opleiding) wordt liefst niet voller ingepland dan {max_basis}% van "
-            "de inzetbare uren. Dit gaat vóór de doelen hieronder: alleen als het echt niet anders kan, komt iemand "
-            "erboven, en dan zo weinig mogelijk."
+            "de inzetbare uren"
+            + (f", en niemand werkt liefst op meer dan {max_afd} afdelingen" if max_afd else "")
+            + ". Dit gaat vóór de doelen hieronder: alleen als het echt niet anders kan, wijkt de planning ervan af, "
+            "en dan zo weinig mogelijk."
         )
-        st.caption(f"In te stellen bij Invoer → Extra eisen → Werkdruk (nu {max_basis}%).")
+        st.caption("In te stellen bij Invoer → Extra eisen → Werkdruk.")
     links, rechts = st.columns(2)
     with links:
         _kaart(
@@ -125,11 +129,11 @@ def pagina_toelichting() -> None:
         )
     with rechts:
         _kaart(
-            2, "Liefst een gz-psycholoog bij alle MDO's",
-            "Geldt voor afdelingen met meerdere MDO's op verschillende dagen. Elk MDO heeft sowieso een psycholoog "
-            "(dat is een regel), maar het liefst is er een gz-psycholoog die bij alle MDO's van de afdeling kan zijn.",
-            "Voorbeeld: Rijnhof heeft MDO's op dinsdag en donderdag; liefst werkt er een gz-psycholoog die op "
-            "beide dagen werkt.",
+            2, "Liefst een gz-psycholoog bij alle IDO's",
+            "Geldt voor afdelingen met meerdere IDO's. Elke IDO heeft sowieso een psycholoog "
+            "(dat is een regel), maar het liefst is er een gz-psycholoog die bij alle IDO's van de afdeling is.",
+            "Voorbeeld: Rijnhof heeft IDO's op dinsdag en donderdag; liefst werkt er een gz-psycholoog die bij "
+            "allebei kan zijn.",
         )
         _kaart(
             4, "Zo weinig mogelijk verschillende mensen per afdeling",
@@ -165,10 +169,14 @@ def pagina_toelichting() -> None:
          "Invoer → Afdelingen (Max. medewerkers)"),
         ("Afdelingsgroep op één locatie", "Afdelingen met hetzelfde label (bv. GRZ) doet een medewerker op één locatie.",
          "Invoer → Afdelingen (Afdelingsgroep)"),
-        ("MDO", "Wie op een afdeling werkt, werkt op de dag van het MDO. Heeft een afdeling meerdere MDO's op "
-         "verschillende dagen, dan is er op elke MDO-dag een psycholoog van de afdeling, en is iedereen daar bij "
-         "minstens één MDO. Werkt er maar één psycholoog, dan is die dus bij alle MDO's.",
-         "Invoer → Afdelingen (MDO-dag) en Team (werkdagen)"),
+        ("IDO", "Bij elke IDO is een psycholoog van de afdeling, en wie op een afdeling werkt, is bij minstens één "
+         "IDO van die afdeling (en werkt dus op die dag). Werkt er maar één psycholoog, dan is die bij alle IDO's. "
+         "Uitzondering: een afspraak 'Hoeft niet bij IDO'.",
+         "Invoer → Afdelingen (IDO's) en Team (werkdagen)"),
+        ("Niet twee IDO's tegelijk", "Niemand hoeft bij twee IDO's op hetzelfde moment te zijn: zelfde dag, zelfde "
+         "weken (elke week botst met even én oneven) en overlappende tijden. Een gezamenlijke IDO van twee "
+         "afdelingen (zelfde label bij 'Samen') telt als één.",
+         "Invoer → Afdelingen (IDO's)"),
         ("Nooit combineren", f"Niemand werkt op twee locaties die nooit samen mogen (nu: {nooit}).",
          "Invoer → Extra eisen → Reizen beperken"),
         ("Afspraken", "Per medewerker: minstens of precies een aantal uren op een afdeling, groep of locatie, of daar "
@@ -211,7 +219,7 @@ def pagina_toelichting() -> None:
     with rechts.container(border=True, key="kaart_toel_niet"):
         st.subheader("Wat neemt de planning niet mee?")
         st.markdown(
-            "- De planning is per week, niet per dag. Werkdagen tellen alleen mee voor de MDO's.\n"
+            "- De planning is per week, niet per dag. Werkdagen en tijden tellen alleen mee voor de IDO's.\n"
             "- Voorkeuren van medewerkers, behalve wat je als afspraak invult.\n"
             "- Reistijd tussen andere locaties dan de ingestelde reisregels.\n"
             "- De planning is een voorstel: controleer het altijd, en stuur bij met afspraken als iets niet klopt."
@@ -222,11 +230,12 @@ def pagina_toelichting() -> None:
         st.markdown(
             "**Beslissingen.** $x_{e,d,l} \\ge 0$: uren van medewerker $e$ op afdeling $d$ op locatie $l$. "
             "Daarnaast ja/nee-variabelen: werkt $e$ op afdeling $d$ ($y_{e,d}$), op locatie $l$ ($y^{loc}_{e,l}$), "
-            "wijkt een toewijzing af van nu ($z_{e,d,l}$), reist $e$ ($w_e$), mist afdeling $d$ een gz-psycholoog bij alle MDO's ($g_{d,l}$)."
+            "wijkt een toewijzing af van nu ($z_{e,d,l}$), reist $e$ ($w_e$), is $e$ bij IDO $k$ ($a_{e,k}$), mist afdeling $d$ een gz-psycholoog bij alle IDO's ($g_{d,l}$)."
         )
         st.markdown("**Belangrijkste regels.**")
         st.latex(r"\sum_e x_{e,d,l} \ge \text{vereist}_{d,l} \qquad \sum_{d,l} x_{e,d,l} \le \text{inzetbaar}_e")
         st.latex(r"\sum_{e \in \text{gz}} y^{loc}_{e,l} \ge 1 \qquad y^{loc}_{e,a} + y^{loc}_{e,b} \le 1 \;\; \text{(nooit combineren)}")
+        st.latex(r"a_{e,k} + a_{e,k'} \le 1 \;\; \text{(IDO's } k, k' \text{ tegelijk)} \qquad \sum_e a_{e,k} \ge 1")
         st.markdown(
             "**Doelen**, lexicografisch: elk doel wordt geminimaliseerd terwijl de uitkomst van de vorige doelen "
             "wordt vastgehouden."
